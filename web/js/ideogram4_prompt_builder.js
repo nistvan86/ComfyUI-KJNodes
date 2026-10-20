@@ -477,6 +477,8 @@ app.registerExtension({
       hideDataWidgets();
 
       node._boxes = [];        // {x,y,w,h normalized 0-1, type, text, desc, palette[]}
+      node._tree = [];         // ordered editor-only box/group references; _boxes stays flat for output
+      node._nextEditorId = 1;
       node._stylePalette = []; // global style color palette (hex[])
       node._activeIdx = -1;
       node._drawing = false;
@@ -1569,6 +1571,58 @@ app.registerExtension({
       }
 
       // ── serialization ──
+      function ensureBoxIds(boxes) {
+        const reserved = new Set(boxes.map((b) => b.$kj?.id).filter((id) => typeof id === "string" && id));
+        const seen = new Set();
+        for (const b of boxes) {
+          let id = b.$kj?.id;
+          if (typeof id !== "string" || !id || seen.has(id)) {
+            do { id = `kj_${node._nextEditorId++}`; } while (reserved.has(id));
+            b.$kj = { ...b.$kj, id };
+          }
+          seen.add(id);
+        }
+      }
+      function treeBoxIds(entries, ids = []) {
+        for (const entry of entries) {
+          if (entry.box) ids.push(entry.box);
+          else if (entry.children) treeBoxIds(entry.children, ids);
+        }
+        return ids;
+      }
+      function resetTree(boxes, savedTree) {
+        ensureBoxIds(boxes);
+        node._boxes = boxes;
+        const ids = boxes.map((b) => b.$kj.id);
+        const groups = new Set();
+        const valid = (entries) => Array.isArray(entries) && entries.every((entry) => {
+          if (!entry || typeof entry !== "object") return false;
+          if (typeof entry.box === "string") return !entry.group && !entry.children;
+          if (typeof entry.group !== "string" || !entry.group || groups.has(entry.group) ||
+              typeof entry.name !== "string" || typeof entry.view !== "number") return false;
+          groups.add(entry.group);
+          return valid(entry.children);
+        });
+        const leaves = Array.isArray(savedTree) && valid(savedTree) ? treeBoxIds(savedTree) : [];
+        node._tree = leaves.length === ids.length && leaves.every((id, i) => id === ids[i])
+          ? savedTree : ids.map((id) => ({ box: id }));
+      }
+      function appendRootBox(box) {
+        node._boxes.push(box);
+        ensureBoxIds(node._boxes);
+        node._tree.push({ box: box.$kj.id });
+      }
+      function removeTreeBox(id, entries = node._tree) {
+        for (let i = entries.length - 1; i >= 0; i--) {
+          const entry = entries[i];
+          if (entry.box === id) entries.splice(i, 1);
+          else if (entry.children) removeTreeBox(id, entry.children);
+        }
+      }
+      function syncBoxesFromTree() {
+        const byId = new Map(node._boxes.map((b) => [b.$kj.id, b]));
+        node._boxes = treeBoxIds(node._tree).map((id) => byId.get(id));
+      }
       // Wired AND the source node isn't muted(2)/bypassed(4) — those keep the link but emit nothing.
       const importConnected = () => {
         const link = node.graph?.links?.[node.inputs?.find((i) => i.name === (spec.importInput || "import_json"))?.link];
@@ -1607,6 +1661,7 @@ app.registerExtension({
       }
 
       function removeBox(i) {
+        removeTreeBox(node._boxes[i].$kj.id);
         node._boxes.splice(i, 1);
         node._selection = new Set();
         if (node._boxes.length === 0) node._activeIdx = -1;
@@ -1618,7 +1673,10 @@ app.registerExtension({
         const idxs = [...node._selection].sort((a, b) => b - a).filter((i) => !node._boxes[i]?.locked);  // keep locked
         if (!idxs.length && node._activeIdx >= 0 && !node._boxes[node._activeIdx]?.locked) idxs.push(node._activeIdx);
         if (!idxs.length) return;
-        for (const i of idxs) node._boxes.splice(i, 1);
+        for (const i of idxs) {
+          removeTreeBox(node._boxes[i].$kj.id);
+          node._boxes.splice(i, 1);
+        }
         node._selection = new Set();
         node._activeIdx = node._boxes.length ? Math.min(idxs[idxs.length - 1], node._boxes.length - 1) : -1;
         if (node._activeIdx >= 0) node._selection.add(node._activeIdx);
@@ -1679,7 +1737,7 @@ app.registerExtension({
           if (spec.views) nb.view = node._view;
           spec.initBox?.(nb, ed, node._viewPrev);           // e.g. join the row selected before a canvas switch
           node._viewPrev = null;
-          node._boxes.push(nb);
+          appendRootBox(nb);
           node._activeIdx = node._boxes.length - 1;
           node._selection = new Set([node._activeIdx]);
           node._boxAtStart = { ...nb };
@@ -1792,7 +1850,7 @@ app.registerExtension({
       // Paste the clipboard regions as a group, centered under the cursor, keeping their layout.
       function pasteBoxes() {
         if (!copiedBoxes || !copiedBoxes.length) return;
-        const clones = copiedBoxes.map((b) => { const c = JSON.parse(JSON.stringify(b)); delete c.locked; return c; });  // pasted = editable
+        const clones = copiedBoxes.map((b) => { const c = JSON.parse(JSON.stringify(b)); delete c.locked; delete c.$kj; return c; });  // pasted = editable
         let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
         for (const b of clones) {
           minx = Math.min(minx, b.x); miny = Math.min(miny, b.y);
@@ -1811,7 +1869,7 @@ app.registerExtension({
           delete b.nobbox;                              // pasted boxes are placed
           if (spec.views) b.view = node._view;          // onto the shown canvas
           spec.initBox?.(b, ed, null);                  // a copy is a new element (fresh id)
-          node._boxes.push(b);
+          appendRootBox(b);
         }
         node._selection = new Set();
         for (let i = start; i < node._boxes.length; i++) node._selection.add(i);
@@ -1901,6 +1959,7 @@ app.registerExtension({
         // a click (no drag) on empty space drops the placeholder box and deselects everything
         const b = node._boxes[node._activeIdx];
         if (b && (b.w < 0.005 || b.h < 0.005) && node._dragMode === "draw") {
+          removeTreeBox(b.$kj.id);
           node._boxes.splice(node._activeIdx, 1);
           selectOnly(node._clickSel ?? -1);            // a click inside a canvas-filling box selects it
         } else if (node._pendingCollapse >= 0) {     // click (no drag) on a group member → keep only it
@@ -1977,9 +2036,9 @@ app.registerExtension({
         const src = node._boxes[srcIdx];
         if (!src) return;
         const nb = JSON.parse(JSON.stringify(src));
-        delete nb.nobbox; delete nb.locked;               // a duplicate is editable, not born locked
-        spec.initBox?.(nb, ed, null);                     // and a new element (fresh id)
-        node._boxes.push(nb);
+        delete nb.nobbox; delete nb.locked; delete nb.$kj; // a duplicate is editable and a new editor leaf
+        spec.initBox?.(nb, ed, null);                     // and a new element (fresh model id)
+        appendRootBox(nb);
         selectOnly(node._boxes.length - 1);
         node._placing = true;
         canvasEl.focus();
@@ -2138,8 +2197,12 @@ app.registerExtension({
                   row._dragged = true;                             // suppress the trailing click
                   const active = node._boxes[node._activeIdx];
                   const order = Array.from(list.querySelectorAll(".kjideo-lrow")).map((el) => el._box);   // front → back
-                  if (order.length === node._boxes.length) node._boxes = FRONT_FIRST ? order : order.reverse();
-                  selectOnly(active ? node._boxes.indexOf(active) : -1);  // reorder invalidates multi-select indices
+                  if (order.length === node._boxes.length && node._tree.length === node._boxes.length && node._tree.every((entry) => entry.box)) {
+                    const entries = new Map(node._tree.map((entry) => [entry.box, entry]));
+                    node._tree = (FRONT_FIRST ? order : order.reverse()).map((b) => entries.get(b.$kj.id));
+                    syncBoxesFromTree();
+                  }
+                  selectOnly(active ? node._boxes.findIndex((b) => b.$kj.id === active.$kj.id) : -1);  // reorder invalidates multi-select indices
                   renumber();
                   commit();
                 }
@@ -2173,7 +2236,7 @@ app.registerExtension({
       stopProp(clearBtn);
       clearBtn.addEventListener("click", () => {
         closeInlineEditor();
-        node._boxes = []; node._activeIdx = -1; node._selection = new Set(); node._stylePalette = [];
+        node._boxes = []; node._tree = []; node._activeIdx = -1; node._selection = new Set(); node._stylePalette = [];
         node._lastImported = "";
         commit(); rebuildStylePalette(); fitCanvas();   // a wired import re-seeds on the next run (serializeValue cache-busts)
       });
@@ -2209,7 +2272,7 @@ app.registerExtension({
       // Caption -> editor boxes (the model's element list), then its caption-level fields (widgets).
       function toBoxes(cap) { return spec.elements(cap).flatMap((el, i) => spec.elemToBox(el, i, ed)).filter(Boolean); }   // an element may span canvases
       function applyCaption(cap) {
-        node._boxes = toBoxes(cap);
+        resetTree(toBoxes(cap));
         selectOnly(node._boxes.length ? 0 : -1);
         spec.applyCaption(cap, ed);
       }
@@ -2250,7 +2313,7 @@ app.registerExtension({
         const added = toBoxes(cap);
         if (!added.length) return;
         const start = node._boxes.length;
-        node._boxes.push(...added);
+        for (const box of added) appendRootBox(box);
         node._selection = new Set();                      // select the inserted regions
         for (let i = start; i < node._boxes.length; i++) node._selection.add(i);
         node._activeIdx = node._boxes.length - 1;
@@ -2296,7 +2359,7 @@ app.registerExtension({
         if (message?.boxes && !node._boxes.length) {
           const seeded = JSON.parse(message.boxes[0]);
           if (Array.isArray(seeded) && seeded.length) {
-            node._boxes = seeded.filter((b) => b && typeof b.x === "number" && typeof b.w === "number");
+            resetTree(seeded.filter((b) => b && typeof b.x === "number" && typeof b.w === "number"));
             selectOnly(node._boxes.length ? 0 : -1);
             commit(); fitCanvas();
           }
@@ -2703,7 +2766,7 @@ app.registerExtension({
       chainCallback(node, "onSerialize", function (o) {
         if (!o) return;
         const p = node.properties;
-        o.ideo = JSON.parse(JSON.stringify({ boxes: node._boxes, palette: node._stylePalette, importMode: findW("import_mode")?.value,
+        o.ideo = JSON.parse(JSON.stringify({ boxes: node._boxes, tree: node._tree, palette: node._stylePalette, importMode: findW("import_mode")?.value,
           outputFormat: findW("output_format")?.value, coordMode: findW("coord_mode")?.value, bboxOrder: findW("bbox_order")?.value,
           dock: { pinned: p.dockPinned, graph: p.dockGraph, rect: p.dockRect, panelH: node._panelH, min: p.dockMin,
             exposeParent: p.exposeToParent, parent: p.dockParent } }));
@@ -2732,7 +2795,7 @@ app.registerExtension({
         if (!boxes) { for (const v of raw) { const b = _parseBoxes(v); if (b) { boxes = b; break; } } }
         if (!boxes) { for (const w of node.widgets || []) { const b = _parseBoxes(w?.value); if (b) { boxes = b; break; } } }
         if (boxes) {
-          node._boxes = boxes.filter((b) => b && typeof b.x === "number");
+          resetTree(boxes.filter((b) => b && typeof b.x === "number"), o?.ideo?.tree);
           selectOnly(node._boxes.length ? 0 : -1);
         }
         const isPal = (p) => Array.isArray(p) && p.length && p.every((c) => typeof c === "string" && c[0] === "#");
