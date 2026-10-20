@@ -387,9 +387,14 @@ function injectStyle() {
     .kjideo-lrow { display:flex; align-items:center; gap:6px; padding:3px 5px; border-radius:4px; cursor:move; user-select:none; touch-action:none; transition:transform .18s ease, box-shadow .12s ease, opacity .12s ease, background .12s; }
     .kjideo-lrow:hover { background:#333; }
     .kjideo-lrow.active { background:#2a3a42; box-shadow:inset 0 0 0 1px #46b4e6; }
-    .kjideo-lrow.dragging { opacity:.4; box-shadow:0 0 0 2px #46b4e6; background:#333; }
+    .kjideo-lrow.dragging { opacity:.4; }
+    .kjideo-drag-ghost { position:fixed; z-index:10001; box-sizing:border-box; pointer-events:none; background:#333; border-radius:4px; box-shadow:0 0 0 2px #46b4e6, 0 6px 16px #0008; opacity:.95; }
+    .kjideo-drag-ghost .kjideo-lrow { transition:none; }
     .kjideo-grow { cursor:pointer; }
     .kjideo-grow .kjideo-ltext { font-weight:600; }
+    .kjideo-drop-before { box-shadow:inset 0 2px #46b4e6; }
+    .kjideo-drop-after { box-shadow:inset 0 -2px #46b4e6; }
+    .kjideo-drop-inside { background:#2a3a42; box-shadow:inset 0 0 0 2px #46b4e6; }
     .kjideo-lsw { width:16px; height:16px; border-radius:3px; border:1px solid #666; flex:0 0 auto; }
     .kjideo-lnum { font:bold 11px monospace; color:#888; flex:0 0 auto; width:18px; }
     .kjideo-ltext { flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -2106,12 +2111,58 @@ app.registerExtension({
         restoreBoxSelection(ids, activeId);
         return true;
       }
-      function ungroupRoot(entry) {
-        const i = node._tree.indexOf(entry);
-        if (i < 0) return;
+      function treeLocation(entry, entries = node._tree, parent = null) {
+        const index = entries.indexOf(entry);
+        if (index >= 0) return { entries, index, parent };
+        for (const item of entries) {
+          if (item.children) {
+            const found = treeLocation(entry, item.children, item);
+            if (found) return found;
+          }
+        }
+        return null;
+      }
+      function containsTreeEntry(group, target) {
+        return group.children?.some((child) => child === target || containsTreeEntry(child, target)) || false;
+      }
+      function treeEntryView(entry) {
+        return entry.group ? entry.view : (node._boxes.find((b) => b.$kj.id === entry.box)?.view || 0);
+      }
+      function canDropTreeEntry(source, target, placement) {
+        if (source === target || !treeLocation(source) || !treeLocation(target) ||
+            (placement !== "inside" && placement !== "before" && placement !== "after") ||
+            (placement === "inside" && !target.group) || containsTreeEntry(source, target)) return false;
+        return !spec.views || (node._view === 0 && treeEntryView(source) === 0 && treeEntryView(target) === 0);
+      }
+      function moveTreeEntry(source, target, placement) {
+        if (!canDropTreeEntry(source, target, placement)) return false;
+        const ids = new Set([...node._selection].map((i) => node._boxes[i]?.$kj.id));
+        const activeId = node._boxes[node._activeIdx]?.$kj.id;
+        const from = treeLocation(source);
+        from.entries.splice(from.index, 1);
+        if (placement === "inside") {
+          if (FRONT_FIRST) target.children.push(source);
+          else target.children.unshift(source);
+        } else {
+          const to = treeLocation(target);
+          const before = placement === "before";
+          to.entries.splice(to.index + (FRONT_FIRST ? (before ? 0 : 1) : (before ? 1 : 0)), 0, source);
+        }
+        if (from.parent && !from.parent.children.length) {
+          const empty = treeLocation(from.parent);
+          empty.entries.splice(empty.index, 1);
+          node._collapsedGroups.delete(from.parent.group);
+        }
+        syncBoxesFromTree();
+        restoreBoxSelection(ids, activeId);
+        return true;
+      }
+      function ungroupTreeEntry(entry) {
+        const location = treeLocation(entry);
+        if (!location) return;
         const ids = new Set([...node._selection].map((idx) => node._boxes[idx]?.$kj.id));
         const activeId = node._boxes[node._activeIdx]?.$kj.id;
-        node._tree.splice(i, 1, ...entry.children);
+        location.entries.splice(location.index, 1, ...entry.children);
         node._collapsedGroups.delete(entry.group);
         syncBoxesFromTree();
         restoreBoxSelection(ids, activeId);
@@ -2120,18 +2171,7 @@ app.registerExtension({
         const byId = new Map(node._boxes.map((b) => [b.$kj.id, b]));
         return node._tree.filter((entry) => entry.box ? onView(byId.get(entry.box)) : !spec.views || entry.view === node._view);
       }
-      function moveRootEntry(entry, direction) {
-        const siblings = visibleRootEntries(), pos = siblings.indexOf(entry);
-        const other = siblings[pos + (FRONT_FIRST ? direction : -direction)];
-        if (pos < 0 || !other) return false;
-        const a = node._tree.indexOf(entry), b = node._tree.indexOf(other);
-        const ids = new Set([...node._selection].map((i) => node._boxes[i]?.$kj.id));
-        const activeId = node._boxes[node._activeIdx]?.$kj.id;
-        [node._tree[a], node._tree[b]] = [node._tree[b], node._tree[a]];
-        syncBoxesFromTree();
-        restoreBoxSelection(ids, activeId);
-        return true;
-      }
+
       function layerRows() {
         const byId = new Map(node._boxes.map((b, i) => [b.$kj.id, i]));
         const rows = [];
@@ -2178,29 +2218,74 @@ app.registerExtension({
           const name = window.prompt("Group name:", "")?.trim();
           if (name && groupSelected(name)) { commit(); buildRows(); }
         });
-        function addOrderButtons(row, entry) {
-          const siblings = visibleRootEntries(), pos = siblings.indexOf(entry);
-          if (pos < 0) return;
-          for (const [direction, label] of [[-1, "↑"], [1, "↓"]]) {
-            const btn = document.createElement("button");
-            btn.className = "kjideo-lbtn"; btn.textContent = label;
-            btn.title = direction < 0 ? "Move toward front" : "Move toward back";
-            btn.disabled = direction < 0 ? pos === (FRONT_FIRST ? 0 : siblings.length - 1)
-              : pos === (FRONT_FIRST ? siblings.length - 1 : 0);
-            btn.addEventListener("click", (e) => {
-              e.stopPropagation();
-              if (moveRootEntry(entry, direction)) { commit(); buildRows(); }
-            });
-            row.appendChild(btn);
-          }
+        function startTreeReorder(e, row, source) {
+          if (e.button !== 0 || e.target.closest("button")) return;
+          e.preventDefault(); e.stopPropagation();
+          const x = e.clientX, y = e.clientY;
+          let dragging = false, drop = null, ghost = null;
+          const clearDrop = () => {
+            for (const r of list.querySelectorAll(".kjideo-lrow"))
+              r.classList.remove("kjideo-drop-before", "kjideo-drop-after", "kjideo-drop-inside");
+          };
+          const move = (me) => {
+            if (!dragging && Math.abs(me.clientX - x) + Math.abs(me.clientY - y) < 4) return;
+            if (!dragging) {
+              dragging = true; row.classList.add("dragging"); document.body.classList.add("kjideo-dragging");
+              const rect = row.getBoundingClientRect();
+              ghost = document.createElement("div");
+              ghost.className = "kjideo-drag-ghost";
+              ghost.appendChild(row.cloneNode(true));
+              if (source.group) {
+                for (let child = row.nextElementSibling; child && child._depth > row._depth; child = child.nextElementSibling)
+                  ghost.appendChild(child.cloneNode(true));
+              }
+              ghost.style.width = rect.width + "px";
+              ghost.style.left = rect.left + "px";
+              ghost.style.top = rect.top + "px";
+              document.body.appendChild(ghost);
+            }
+            ghost.style.transform = `translate(${me.clientX - x}px, ${me.clientY - y}px)`;
+            clearDrop(); drop = null;
+            const bounds = menu.getBoundingClientRect();
+            if (me.clientX < bounds.left || me.clientX > bounds.right) return;
+            for (const targetRow of list.querySelectorAll(".kjideo-lrow")) {
+              const r = targetRow.getBoundingClientRect();
+              if (me.clientY < r.top || me.clientY > r.bottom) continue;
+              const target = targetRow._entry;
+              const ratio = (me.clientY - r.top) / r.height;
+              const placement = target.group && ratio >= 0.25 && ratio <= 0.75 ? "inside"
+                : ratio < 0.5 ? "before" : "after";
+              if (canDropTreeEntry(source, target, placement)) {
+                drop = { target, placement };
+                targetRow.classList.add("kjideo-drop-" + placement);
+              }
+              break;
+            }
+          };
+          const up = (ue) => {
+            document.removeEventListener("pointermove", move);
+            document.removeEventListener("pointerup", up);
+            document.removeEventListener("pointercancel", up);
+            clearDrop();
+            ghost?.remove();
+            document.body.classList.remove("kjideo-dragging");
+            if (!dragging) {
+              if (ue.type === "pointerup" && !source.group) row.click();
+              return;
+            }
+            row.classList.remove("dragging"); row._dragged = true;
+            if (ue.type === "pointerup" && drop && moveTreeEntry(source, drop.target, drop.placement)) { commit(); buildRows(); }
+          };
+          document.addEventListener("pointermove", move);
+          document.addEventListener("pointerup", up);
+          document.addEventListener("pointercancel", up);
         }
         function buildRows() {
           list.innerHTML = "";
           const rows = layerRows();
           const rootOnly = visibleRootEntries().every((entry) => entry.box);
           groupBtn.disabled = !selectedRootEntries().length;
-          hdr.textContent = NOUN[0].toUpperCase() + NOUN.slice(1) + (rootOnly
-            ? "s — top = front · click select · drag reorder" : "s — top = front · click select · expand groups");
+          hdr.textContent = NOUN[0].toUpperCase() + NOUN.slice(1) + "s — top = front · drag reorder";
           if (!rows.length) {
             const empty = document.createElement("div");
             empty.className = "kjideo-mhdr"; empty.textContent = `No ${NOUN}s yet.`;
@@ -2209,9 +2294,11 @@ app.registerExtension({
           }
           for (const { entry, i, depth } of rows) {
             const row = document.createElement("div");
+            row._depth = depth;
             row.style.paddingLeft = (5 + depth * 14) + "px";
             if (entry.group) {
               row.className = "kjideo-lrow kjideo-grow";
+              row._entry = entry;
               const toggle = document.createElement("button");
               toggle.className = "kjideo-lbtn";
               toggle.textContent = node._collapsedGroups.has(entry.group) ? "▸" : "▾";
@@ -2220,36 +2307,34 @@ app.registerExtension({
               name.className = "kjideo-ltext";
               name.textContent = entry.name || "(group)";
               row.append(toggle, name);
-              if (node._tree.includes(entry)) {
-                addOrderButtons(row, entry);
-                const rename = document.createElement("button");
-                rename.className = "kjideo-lbtn"; rename.textContent = "✎"; rename.title = "Rename group";
-                rename.addEventListener("click", (e) => {
-                  e.stopPropagation();
-                  const value = window.prompt("Group name:", entry.name);
-                  if (value?.trim()) { entry.name = value.trim(); commit(); buildRows(); }
-                });
-                const ungroup = document.createElement("button");
-                ungroup.className = "kjideo-lbtn"; ungroup.textContent = "Ungroup"; ungroup.title = "Keep boxes in their current order";
-                ungroup.addEventListener("click", (e) => {
-                  e.stopPropagation();
-                  ungroupRoot(entry); commit(); buildRows();
-                });
-                row.append(rename, ungroup);
-              }
-              row.addEventListener("click", (e) => {
+              const rename = document.createElement("button");
+              rename.className = "kjideo-lbtn"; rename.textContent = "✎"; rename.title = "Rename group";
+              rename.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const value = window.prompt("Group name:", entry.name);
+                if (value?.trim()) { entry.name = value.trim(); commit(); buildRows(); }
+              });
+              const ungroup = document.createElement("button");
+              ungroup.className = "kjideo-lbtn"; ungroup.textContent = "Ungroup"; ungroup.title = "Keep boxes in their current order";
+              ungroup.addEventListener("click", (e) => {
+                e.stopPropagation();
+                ungroupTreeEntry(entry); commit(); buildRows();
+              });
+              row.append(rename, ungroup);
+              toggle.addEventListener("click", (e) => {
                 e.stopPropagation();
                 if (node._collapsedGroups.has(entry.group)) node._collapsedGroups.delete(entry.group);
                 else node._collapsedGroups.add(entry.group);
                 buildRows();
               });
               list.appendChild(row);
+              if (!rootOnly && (!spec.views || node._view === 0))
+                row.addEventListener("pointerdown", (e) => startTreeReorder(e, row, entry));
               continue;
             }
             const b = node._boxes[i];
             row.className = "kjideo-lrow" + (i === node._activeIdx ? " active" : "");
             row._entry = entry;
-            if (!rootOnly) row.style.cursor = "default";
             const sw = document.createElement("div");
             sw.className = "kjideo-lsw";
             sw.style.background = (b.palette || []).find(Boolean) || "#8c8c8c";
@@ -2272,8 +2357,9 @@ app.registerExtension({
             del.title = b.locked ? "Unlock to delete" : "Delete " + NOUN;
             del.disabled = !!b.locked;
             row.append(sw, num, txt, lock, dup, del);
-            if (!rootOnly && depth === 0) addOrderButtons(row, entry);
             list.appendChild(row);
+            if (!rootOnly && (!spec.views || node._view === 0))
+              row.addEventListener("pointerdown", (e) => startTreeReorder(e, row, entry));
 
             lock.addEventListener("click", (e) => {
               e.stopPropagation();
@@ -2291,6 +2377,7 @@ app.registerExtension({
             row.addEventListener("click", () => {
               if (row._dragged) { row._dragged = false; return; }
               selectOnly(node._boxes.findIndex((box) => box.$kj.id === entry.box));
+              canvasEl.focus();
               commit();
               groupBtn.disabled = !selectedRootEntries().length;
               for (const r of list.querySelectorAll(".kjideo-lrow")) r.classList.toggle("active", r._entry === entry);
