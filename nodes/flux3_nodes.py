@@ -13,6 +13,9 @@ import json
 import math
 import re
 
+import torch
+
+from comfy.utils import common_upscale
 from comfy_api.latest import io
 
 from .ideogram4_nodes import _render_preview, _parse_json_list, _norm_bbox, _seed_boxes, _bbox_outputs, _bg_image
@@ -287,6 +290,135 @@ current canvas.""",
             ui["caption"] = [import_caption]
         return io.NodeOutput(caption, preview, _bbox_outputs(out_boxes, width, height), width, height,
                              _upsampler_input(prompt, rows, bool(slots)), ui=ui)
+
+
+def _pack_collage(sizes, canvas_width, canvas_height):
+    gap = 32
+    available_width, available_height = canvas_width - gap, canvas_height - gap
+
+    def layout(scale):
+        patches = {i: (max(1, round(w * scale)), max(1, round(h * scale))) for i, w, h in sizes}
+        ordered = sorted(((i, w + gap, h + gap) for i, (w, h) in patches.items()), key=lambda item: item[2], reverse=True)
+        area = sum(w * h for _, w, h in ordered)
+        widest = max(w for _, w, _ in ordered)
+        root = math.sqrt(area)
+        widths = {widest, sum(w for _, w, _ in ordered), available_width}
+        widths.update(max(widest, round(root * factor)) for factor in (1, 1.25, 1.5, 2, 3))
+        best = None
+        for limit in widths:
+            if limit < widest or limit > available_width:
+                continue
+            shelves = []
+            positions = {}
+            for index, w, h in ordered:
+                shelf = next((s for s in shelves if s[0] + w <= limit), None)
+                if shelf is None:
+                    shelf = [0, h, sum(s[1] for s in shelves)]
+                    shelves.append(shelf)
+                positions[index] = (shelf[0], shelf[2])
+                shelf[0] += w
+            width = max(s[0] for s in shelves)
+            height = sum(s[1] for s in shelves)
+            if height <= available_height and (best is None or (width * height, max(width, height)) <
+                                               (best[0] * best[1], max(best[0], best[1]))):
+                best = width, height, positions, patches
+        return best
+
+    best = layout(1.0)
+    if best is None:
+        best = layout(0.0)
+        if best is None:
+            raise ValueError("Canvas too small to fit collage elements with 32 pixel gaps")
+        low, high = 0.0, 1.0
+        for _ in range(18):
+            mid = (low + high) / 2
+            candidate = layout(mid)
+            if candidate is None:
+                high = mid
+            else:
+                low, best = mid, candidate
+    return best
+
+
+class Flux3BBoxCollageKJ(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Flux3BBoxCollageKJ",
+            display_name="FLUX.3 BBox Collage KJ",
+            category="KJNodes/image",
+            description="Pack cropped references at their target-box sizes with 32 pixel gaps and margins. "
+                        "Per-reference scale factors adjust those sizes before fitting; the rewritten prompt uses ref_image_0.",
+            inputs=[
+                io.String.Input("prompt", force_input=True, tooltip="FLUX.3 Prompt Builder prompt, including its box table."),
+                io.Int.Input("width", default=1024, min=1, max=16384, force_input=True),
+                io.Int.Input("height", default=1024, min=1, max=16384, force_input=True),
+                io.Color.Input("background_color", default="#808080"),
+                io.Autogrow.Input("images", template=io.Autogrow.TemplatePrefix(
+                    io.Image.Input("image"), prefix="ref_image_", min=0, max=MAX_REFS,
+                ), tooltip="References in the model's order: ref_image_0 is the first connected builder reference. "
+                           "The first frame of each image is used."),
+                *[io.Float.Input(f"ref_image_{i}_scale", default=1.0, min=0.0, step=0.05, socketless=True,
+                                 tooltip=f"Size multiplier for ref_image_{i} (default 1.0).") for i in range(MAX_REFS)],
+            ],
+            outputs=[io.String.Output(display_name="prompt"), io.Image.Output(display_name="image")],
+        )
+
+    @classmethod
+    def execute(cls, prompt, width, height, background_color="#808080", images=None, **scales) -> io.NodeOutput:
+        color = background_color.removeprefix("#")
+        if len(color) not in (6, 8) or any(c not in "0123456789abcdefABCDEF" for c in color):
+            raise ValueError("Background color must be #RRGGBB or #RRGGBBAA")
+        rgb = [int(color[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        caption, rows = _split_caption(prompt)
+        images = images or {}
+        patches = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict) or not str(row.get("from", "")).startswith("ref_image_"):
+                continue
+            origin = row["from"]
+            image = images.get(origin)
+            if image is None:
+                raise ValueError(f"Missing collage input {origin} for {row.get('id', 'box')}")
+            sy1, sx1, sy2, sx2 = row["src_bbox"]
+            ih, iw = image.shape[1:3]
+            x1, x2 = max(0, round(sx1 * iw / 1000)), min(iw, round(sx2 * iw / 1000))
+            y1, y2 = max(0, round(sy1 * ih / 1000)), min(ih, round(sy2 * ih / 1000))
+            if x2 <= x1 or y2 <= y1:
+                raise ValueError(f"Empty source box for {row.get('id', 'box')}")
+            tgt = row.get("tgt_bbox")
+            factor = scales.get(f"{origin}_scale", 1.0)
+            w = (tgt[3] - tgt[1]) * width / 1000 if tgt else x2 - x1
+            h = (tgt[2] - tgt[0]) * height / 1000 if tgt else y2 - y1
+            patches.append((index, image, (x1, y1, x2, y2), max(1, round(w * factor)), max(1, round(h * factor))))
+
+        first_image = patches[0][1] if patches else None
+        bg = torch.tensor(rgb, device=first_image.device if first_image is not None else "cpu",
+                          dtype=first_image.dtype if first_image is not None else torch.float32)
+        canvas = bg.reshape(1, 1, 3).expand(height, width, 3).clone()
+        if not patches:
+            return io.NodeOutput(prompt, canvas.unsqueeze(0))
+        cw, ch, positions, patch_sizes = _pack_collage([(i, w, h) for i, _, _, w, h in patches], width, height)
+        offset_x = (width - cw + 32) // 2
+        offset_y = (height - ch + 32) // 2
+
+        for index, image, (x1, y1, x2, y2), w, h in patches:
+            x, y = positions[index]
+            pw, ph = patch_sizes[index]
+            left, top = offset_x + x, offset_y + y
+            right, bottom = left + pw, top + ph
+            crop = image[:1, y1:y2, x1:x2, :3].movedim(-1, 1).to(canvas.device)
+            fit = min(pw / (x2 - x1), ph / (y2 - y1))
+            rw, rh = max(1, min(pw, round((x2 - x1) * fit))), max(1, min(ph, round((y2 - y1) * fit)))
+            resized = common_upscale(crop, rw, rh, "bilinear", "disabled").movedim(1, -1)[0]
+            canvas[top + (ph - rh) // 2:top + (ph - rh) // 2 + rh,
+                   left + (pw - rw) // 2:left + (pw - rw) // 2 + rw] = resized
+            rows[index] = {**rows[index], "from": "ref_image_0",
+                           "src_bbox": [round(top * 1000 / height), round(left * 1000 / width),
+                                        round(bottom * 1000 / height), round(right * 1000 / width)]}
+
+        rewritten = f"{caption} {json.dumps(rows, ensure_ascii=False)}" if rows else prompt
+        return io.NodeOutput(rewritten, canvas.unsqueeze(0))
 
 
 class Flux3BoxReconcileKJ(io.ComfyNode):

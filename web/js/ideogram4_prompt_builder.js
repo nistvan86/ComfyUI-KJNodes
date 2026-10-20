@@ -2025,8 +2025,11 @@ app.registerExtension({
         menu.appendChild(list);
         node._layerMenu = menu;
 
+        const numberOf = (b) => spec.views && spec.linkKey
+          ? [...new Set(node._boxes.map((box) => box[spec.linkKey]))].indexOf(b[spec.linkKey]) + 1
+          : node._boxes.indexOf(b) + 1;
         const renumber = () => Array.from(list.querySelectorAll(".kjideo-lrow")).forEach((row) => {
-          row.querySelector(".kjideo-lnum").textContent = String(node._boxes.indexOf(row._box) + 1).padStart(2, "0");
+          row.querySelector(".kjideo-lnum").textContent = String(numberOf(row._box)).padStart(2, "0");
         });
         function buildRows() {
           list.innerHTML = "";
@@ -2045,7 +2048,7 @@ app.registerExtension({
             sw.className = "kjideo-lsw";
             sw.style.background = (b.palette || []).find(Boolean) || "#8c8c8c";
             const num = document.createElement("span");
-            num.className = "kjideo-lnum"; num.textContent = String(i + 1).padStart(2, "0");
+            num.className = "kjideo-lnum"; num.textContent = String(numberOf(b)).padStart(2, "0");
             const txt = document.createElement("span");
             const label = rowLabel(b);
             txt.className = "kjideo-ltext" + (label ? "" : " empty");
@@ -2138,7 +2141,20 @@ app.registerExtension({
                   row._dragged = true;                             // suppress the trailing click
                   const active = node._boxes[node._activeIdx];
                   const order = Array.from(list.querySelectorAll(".kjideo-lrow")).map((el) => el._box);   // front → back
-                  if (order.length === node._boxes.length) node._boxes = FRONT_FIRST ? order : order.reverse();
+                  if (spec.views && spec.linkKey) {
+                    const groups = new Map();
+                    for (const box of node._boxes) {
+                      const key = box[spec.linkKey];
+                      if (!groups.has(key)) groups.set(key, []);
+                      groups.get(key).push(box);
+                    }
+                    const reordered = [...new Set((FRONT_FIRST ? order : order.reverse()).map((box) => box[spec.linkKey]))];
+                    const visible = new Set(reordered);
+                    let next = 0;
+                    node._boxes = [...groups.keys()].flatMap((key) => groups.get(visible.has(key) ? reordered[next++] : key));
+                  } else if (order.length === node._boxes.length) {
+                    node._boxes = FRONT_FIRST ? order : order.reverse();
+                  }
                   selectOnly(active ? node._boxes.indexOf(active) : -1);  // reorder invalidates multi-select indices
                   renumber();
                   commit();

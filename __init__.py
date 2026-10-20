@@ -83,7 +83,8 @@ from .nodes.hdr_preview_node import HDRPreviewKJ
 from .nodes.preview_override_node import ModelPreviewOverrideKJ, GetPreviewOverrideFramesKJ
 from .nodes.context_windows_visualizer import ContextWindowsVisualizerKJ
 from .nodes.ideogram4_nodes import Ideogram4PromptBuilderKJ
-from .nodes.flux3_nodes import Flux3PromptBuilderKJ, Flux3BoxReconcileKJ
+from .nodes.flux3_nodes import Flux3PromptBuilderKJ, Flux3BoxReconcileKJ, Flux3BBoxCollageKJ
+from .nodes.qwen_nodes import TextEncodeQwenImage21ScheduledKJ
 
 import logging
 
@@ -194,6 +195,8 @@ NODE_CONFIG = {
     "Ideogram4PromptBuilderKJ": {"class": Ideogram4PromptBuilderKJ, "name": "Ideogram 4 Prompt Builder KJ"},
     "Flux3PromptBuilderKJ": {"class": Flux3PromptBuilderKJ, "name": "FLUX.3 Prompt Builder KJ"},
     "Flux3BoxReconcileKJ": {"class": Flux3BoxReconcileKJ, "name": "FLUX.3 Box Reconcile KJ"},
+    "Flux3BBoxCollageKJ": {"class": Flux3BBoxCollageKJ, "name": "FLUX.3 BBox Collage KJ"},
+    "TextEncodeQwenImage21ScheduledKJ": {"class": TextEncodeQwenImage21ScheduledKJ, "name": "Text Encode Qwen Image 2.1 Scheduled KJ"},
     "HDRPreviewKJ": {"class": HDRPreviewKJ, "name": "HDR Preview KJ"},
     "ModelPreviewOverrideKJ": {"class": ModelPreviewOverrideKJ, "name": "Model Preview Override KJ"},
     "GetPreviewOverrideFramesKJ": {"class": GetPreviewOverrideFramesKJ, "name": "Get Preview Override Frames KJ"},
