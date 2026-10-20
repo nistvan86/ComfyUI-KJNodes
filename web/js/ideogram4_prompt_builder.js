@@ -1235,13 +1235,22 @@ app.registerExtension({
         return treeBoxIds([entry]).map((id) => node._boxes.findIndex((b) => b.$kj.id === id))
           .filter((i) => i >= 0 && onView(node._boxes[i]));
       }
-      function groupBounds(entry) {
-        const leaves = groupLeaves(entry).filter((i) => !node._boxes[i].nobbox);
-        if (!leaves.length) return null;
-        const boxes = leaves.map((i) => node._boxes[i]);
+      function boundsFor(indices) {
+        const boxes = indices.map((i) => node._boxes[i]).filter((b) => b && onView(b) && !b.nobbox);
+        if (!boxes.length) return null;
         const x = Math.min(...boxes.map((b) => b.x)), y = Math.min(...boxes.map((b) => b.y));
         return { x, y, w: Math.max(...boxes.map((b) => b.x + b.w)) - x,
           h: Math.max(...boxes.map((b) => b.y + b.h)) - y };
+      }
+      function groupBounds(entry) { return boundsFor(groupLeaves(entry)); }
+      function collectiveBounds() {
+        if (groupsEnabled() && node._selectedGroupId) return groupBounds(groupEntry(node._selectedGroupId));
+        return node._selection.size > 1 ? boundsFor([...node._selection]) : null;
+      }
+      function collectiveHit(mN, b) {
+        if (!b) return null;
+        const rx = Math.min(HANDLE / logW(), b.w / 3), ry = Math.min(HANDLE / logH(), b.h / 3);
+        return rectHitTestN(mN.x, mN.y, b.x, b.y, b.x + b.w, b.y + b.h, rx, ry);
       }
       function levelEntries() {
         return node._editingGroupId ? groupEntry(node._editingGroupId)?.children || [] : node._tree;
@@ -1268,9 +1277,12 @@ app.registerExtension({
       }
       // All boxes under the point, top-first to match draw order: the active box is
       // drawn last (on top), then the rest front-most first (see stackOrder).
-      function boxesAt(mN) {
+      function boxesAt(mN, cycle = false) {
         const baseRx = HANDLE / logW(), baseRy = HANDLE / logH();
         const res = [];
+        const collective = collectiveHit(mN, collectiveBounds());
+        if (!cycle && collective && collective !== "move" && node._selectedGroupId) return [{ group: node._selectedGroupId, mode: collective }];
+        if (!cycle && collective && collective !== "move" && node._selection.size > 1) return [{ index: node._activeIdx, mode: collective, collective: true }];
         const direct = groupsEnabled() ? directBoxIndices() : null;
         for (const i of stackOrder()) {
           const b = node._boxes[i];
@@ -1285,7 +1297,7 @@ app.registerExtension({
             const b = groupBounds(entry);
             if (!b || mN.x < b.x || mN.x > b.x + b.w || mN.y < b.y || mN.y > b.y + b.h) continue;
             const leaves = groupLeaves(entry);
-            if (leaves.some((i) => { const leaf = node._boxes[i]; return mN.x >= leaf.x && mN.x <= leaf.x + leaf.w && mN.y >= leaf.y && mN.y <= leaf.y + leaf.h; }) || node._selectedGroupId === entry.group)
+            if (leaves.some((i) => { const leaf = node._boxes[i]; return !leaf.nobbox && mN.x >= leaf.x && mN.x <= leaf.x + leaf.w && mN.y >= leaf.y && mN.y <= leaf.y + leaf.h; }) || node._selectedGroupId === entry.group)
               res.push({ group: entry.group, mode: "move" });
           }
         }
@@ -1384,10 +1396,12 @@ app.registerExtension({
       // title-chip click selects that box (drawn to front); Alt-click cycles the
       // overlap stack; else the topmost box.
       function pickForSelection(mN, cycle) {
-        const cands = boxesAt(mN);
+        const cands = boxesAt(mN, cycle);
         if (!cands.length) return null;
         const ah = cands.find((c) => c.index === node._activeIdx && c.mode !== "move");
         if (ah && !cycle) return ah;
+        if (!cycle && cands[0]?.group === node._selectedGroupId && cands[0].mode !== "move") return cands[0];
+        if (!cycle && cands[0]?.collective) return cands[0];
         const ti = titleAt(mN);
         if (ti !== null && !cycle) return { index: ti, mode: "move" };
         if (cycle && cands.length > 1) {
@@ -1658,6 +1672,15 @@ app.registerExtension({
             ctx.fillText((entry.name || "(group)") + (locked ? " 🔒" : ""), x1 + 3, Math.max(12, y1 - 3));
           }
         }
+        const collective = showSel && collectiveBounds();
+        if (collective) {
+          const { x1, y1, x2, y2 } = toPx(collective);
+          ctx.strokeStyle = "#ff8c00"; ctx.lineWidth = 1;
+          if (!node._selectedGroupId) { ctx.setLineDash([5, 3]); ctx.strokeRect(x1, y1, x2 - x1, y2 - y1); ctx.setLineDash([]); }
+          for (const [x, y] of [[x1,y1],[x2,y1],[x1,y2],[x2,y2],[(x1+x2)/2,y1],[(x1+x2)/2,y2],[x1,(y1+y2)/2],[x2,(y1+y2)/2]]) {
+            ctx.fillStyle = "#ff8c00"; ctx.fillRect(x - 3, y - 3, 6, 6);
+          }
+        }
         const apIdx = node._altPreview ?? -1;                 // Alt-held: ring the box an alt-click would select next
         if (apIdx >= 0 && apIdx < node._boxes.length && onView(node._boxes[apIdx])) {
           const { x1, y1, x2, y2 } = toPx(node._boxes[apIdx]);
@@ -1834,11 +1857,12 @@ app.registerExtension({
         node._clickSel = drawThrough(hit) ? hit.index : -1;
         if (hit?.group) {
           selectGroup(hit.group);
-          node._dragMode = "group-move";
+          node._dragMode = hit.mode === "move" ? "group-move" : "collective-" + hit.mode.slice(7);
           const entry = groupEntry(hit.group);
           if (!groupLeaves(entry).some((i) => node._boxes[i].locked)) {
             node._groupStart = {};
             for (const i of groupLeaves(entry)) if (!node._boxes[i].nobbox) node._groupStart[i] = { ...node._boxes[i] };
+            node._collectiveStart = groupBounds(entry);
           }
           node._drawing = true; node._dragStartN = mN;
           canvasEl.addEventListener("pointermove", onMove);
@@ -1851,11 +1875,12 @@ app.registerExtension({
           if (!node._selection.has(hit.index)) node._selection = new Set([hit.index]);  // outside selection → pick it
           else if (node._selection.size > 1) node._pendingCollapse = hit.index;          // click (no drag) collapses
           node._activeIdx = hit.index;
-          node._dragMode = hit.mode;
+          node._dragMode = node._selection.size > 1 && hit.mode.startsWith("resize-") ? "collective-" + hit.mode.slice(7) : hit.mode;
           node._boxAtStart = { ...node._boxes[hit.index] };
           if (node._selection.size > 1) {                  // snapshot the whole group for group move/resize
             node._groupStart = {};
-            for (const i of node._selection) node._groupStart[i] = { ...node._boxes[i] };
+            for (const i of node._selection) if (!node._boxes[i].nobbox && !node._boxes[i].locked && onView(node._boxes[i])) node._groupStart[i] = { ...node._boxes[i] };
+            node._collectiveStart = boundsFor(Object.keys(node._groupStart).map(Number));
           }
         } else {
           node._dragMode = "draw";
@@ -2034,7 +2059,7 @@ app.registerExtension({
         const mN = mouseN(e);
         const dN = { x: mN.x - node._dragStartN.x, y: mN.y - node._dragStartN.y };
         if (Math.abs(dN.x) + Math.abs(dN.y) > 0.001) node._pendingCollapse = -1;  // it's a drag, not a click
-        if (node._dragMode === "group-move" && !node._groupStart) return;
+        if ((node._dragMode === "group-move" || node._dragMode.startsWith("collective-")) && !node._groupStart) return;
         if ((node._dragMode === "move" || node._dragMode === "group-move") && node._groupStart) {
           let dx = dN.x, dy = dN.y;                   // clamp delta so the whole group stays in bounds
           for (const i in node._groupStart) {
@@ -2046,6 +2071,11 @@ app.registerExtension({
             const { sx, sy } = gridStep();
             dx = Math.round(dx / sx) * sx;
             dy = Math.round(dy / sy) * sy;
+            for (const i in node._groupStart) {
+              const s = node._groupStart[i];
+              dx = Math.min(Math.max(dx, -s.x), 1 - s.w - s.x);
+              dy = Math.min(Math.max(dy, -s.y), 1 - s.h - s.y);
+            }
           }
           for (const i in node._groupStart) {
             const s = node._groupStart[i];
@@ -2055,21 +2085,27 @@ app.registerExtension({
           drawCanvas(); updateBboxLabel();
           return;
         }
-        if (node._groupStart && node._dragMode.startsWith("resize")) {
-          // Scale every selected box by the primary's resize, about the handle's fixed edge.
-          const a = node._boxAtStart, na = applyDrag(node._dragMode, a, dN);
-          const suf = node._dragMode.slice(7);       // "tl"|"tr"|"bl"|"br"|"t"|"b"|"l"|"r"
-          const scaleX = (suf.includes("l") || suf.includes("r")) && a.w > 0 ? Math.max(0.02, na.w / a.w) : 1;
-          const scaleY = (suf.includes("t") || suf.includes("b")) && a.h > 0 ? Math.max(0.02, na.h / a.h) : 1;
-          const ax = suf.includes("l") ? a.x + a.w : a.x;   // fixed (anchor) edges
-          const ay = suf.includes("t") ? a.y + a.h : a.y;
+        if (node._dragMode.startsWith("collective-") && node._collectiveStart) {
+          const a = node._collectiveStart, suf = node._dragMode.slice(11);
+          const step = node.properties.snap ? gridStep() : null;
+          const edge = (value, delta, size) => {
+            const proposed = value + delta;
+            return clamp01(step ? Math.round(proposed / size) * size : proposed);
+          };
+          const minX = Math.min(1 / logW(), a.w || 1), minY = Math.min(1 / logH(), a.h || 1);
+          let l = a.x, r = a.x + a.w, t = a.y, b = a.y + a.h;
+          if (a.w > 0) {
+            if (suf.includes("l")) l = Math.min(edge(l, dN.x, step?.sx), r - minX);
+            if (suf.includes("r")) r = Math.max(edge(r, dN.x, step?.sx), l + minX);
+          }
+          if (a.h > 0) {
+            if (suf.includes("t")) t = Math.min(edge(t, dN.y, step?.sy), b - minY);
+            if (suf.includes("b")) b = Math.max(edge(b, dN.y, step?.sy), t + minY);
+          }
+          const sx = a.w > 0 ? (r - l) / a.w : 1, sy = a.h > 0 ? (b - t) / a.h : 1;
           for (const i in node._groupStart) {
             const s = node._groupStart[i];
-            node._boxes[i] = normalizeBox({
-              ...s, x: ax + (s.x - ax) * scaleX, y: ay + (s.y - ay) * scaleY,
-              w: s.w * scaleX, h: s.h * scaleY,
-            });
-            delete node._boxes[i].nobbox;
+            node._boxes[i] = { ...s, x: l + (s.x - a.x) * sx, y: t + (s.y - a.y) * sy, w: s.w * sx, h: s.h * sy };
           }
           drawCanvas(); updateBboxLabel();
           return;
@@ -2095,7 +2131,7 @@ app.registerExtension({
         } else if (node._pendingCollapse >= 0) {     // click (no drag) on a group member → keep only it
           selectOnly(node._pendingCollapse);
         }
-        node._pendingCollapse = -1; node._groupStart = null;
+        node._pendingCollapse = -1; node._groupStart = null; node._collectiveStart = null;
         commit();
       }
 
