@@ -1923,7 +1923,7 @@ app.registerExtension({
         const t = hoverTargets(mN, alt, force);
         applyHover(t);
         canvasEl.style.cursor = (alt && !force) ? (t.ap >= 0 ? "pointer" : "crosshair")
-          : (t.ti != null ? "pointer" : (t.hit ? (t.hit.group ? "move" : cursorForBboxMode(t.hit.mode) || "crosshair") : "crosshair"));
+          : (t.ti != null ? "pointer" : (t.hit ? (cursorForBboxMode(t.hit.mode) || (t.hit.group ? "move" : "crosshair")) : "crosshair"));
       });
       // Alt pressed/released without moving the mouse — refresh the preview from the last cursor position.
       node._altRefresh = (altDown) => {
