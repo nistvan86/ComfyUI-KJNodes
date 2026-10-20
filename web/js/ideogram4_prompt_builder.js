@@ -486,6 +486,8 @@ app.registerExtension({
       node._boxes = [];        // {x,y,w,h normalized 0-1, type, text, desc, palette[]}
       node._tree = [];         // ordered editor-only box/group references; _boxes stays flat for output
       node._collapsedGroups = new Set();
+      node._selectedGroupId = null;
+      node._editingGroupId = null;
       node._nextEditorId = 1;
       node._stylePalette = []; // global style color palette (hex[])
       node._activeIdx = -1;
@@ -793,7 +795,17 @@ app.registerExtension({
       viewSel.title = `Canvas: the output, or a reference to mark where a ${NOUN}'s object is in it`;
       stopProp(viewSel);
       viewSel.addEventListener("change", () => switchView(parseInt(viewSel.value, 10)));
+      const level = document.createElement("span");
+      level.style.cssText = "flex:0 0 auto;";
+      const exitGroup = document.createElement("button");
+      exitGroup.className = "kjideo-btn"; exitGroup.textContent = "Exit group";
+      exitGroup.addEventListener("click", () => {
+        const current = groupEntry(node._editingGroupId);
+        node._editingGroupId = current ? treeLocation(current)?.parent?.group || null : null;
+        selectOnly(-1); commit();
+      });
       bar.appendChild(hint);
+      bar.appendChild(level); bar.appendChild(exitGroup);
       if (spec.views) bar.appendChild(viewSel);
       bar.appendChild(tokenSpan);
       if (!spec.textCaption) bar.appendChild(outBtn);
@@ -1148,6 +1160,7 @@ app.registerExtension({
         closeInlineEditor();
         const prev = node._boxes[node._activeIdx] || null;
         node._view = k;
+        node._editingGroupId = null; node._selectedGroupId = null;
         const key = spec.linkKey;
         const twin = prev && key ? node._boxes.findIndex((o) => o !== prev && onView(o) && o[key] === prev[key]) : -1;
         node._viewPrev = twin < 0 ? prev : null;
@@ -1202,23 +1215,85 @@ app.registerExtension({
       // A box filling the canvas can't move, so dragging inside it draws a new box instead (a click still
       // selects it) — otherwise a full-canvas background would leave no empty space to draw on.
       function drawThrough(hit) {
-        const b = hit && hit.mode === "move" && node._boxes[hit.index];
+        const b = hit && !hit.group && hit.mode === "move" && node._boxes[hit.index];
         return !!b && b.w >= 0.995 && b.h >= 0.995;
       }
 
+      function groupsEnabled() { return !spec.views || node._view === 0; }
+      function groupEntry(id) {
+        if (!id) return null;
+        const visit = (entries) => {
+          for (const entry of entries) {
+            if (entry.group === id) return entry;
+            if (entry.children) { const found = visit(entry.children); if (found) return found; }
+          }
+          return null;
+        };
+        return visit(node._tree);
+      }
+      function groupLeaves(entry) {
+        return treeBoxIds([entry]).map((id) => node._boxes.findIndex((b) => b.$kj.id === id))
+          .filter((i) => i >= 0 && onView(node._boxes[i]));
+      }
+      function groupBounds(entry) {
+        const leaves = groupLeaves(entry).filter((i) => !node._boxes[i].nobbox);
+        if (!leaves.length) return null;
+        const boxes = leaves.map((i) => node._boxes[i]);
+        const x = Math.min(...boxes.map((b) => b.x)), y = Math.min(...boxes.map((b) => b.y));
+        return { x, y, w: Math.max(...boxes.map((b) => b.x + b.w)) - x,
+          h: Math.max(...boxes.map((b) => b.y + b.h)) - y };
+      }
+      function levelEntries() {
+        return node._editingGroupId ? groupEntry(node._editingGroupId)?.children || [] : node._tree;
+      }
+      function directBoxIndices() {
+        const ids = new Set(levelEntries().filter((entry) => entry.box).map((entry) => entry.box));
+        return new Set(node._boxes.flatMap((b, i) => ids.has(b.$kj.id) && onView(b) ? [i] : []));
+      }
+      function selectGroup(id) {
+        node._selectedGroupId = id;
+        node._activeIdx = -1; node._selection = new Set();
+      }
+      function enterGroup(id) {
+        if (!groupsEnabled() || !groupEntry(id)) return;
+        node._editingGroupId = id; selectOnly(-1); commit();
+      }
+      function refreshLevel() {
+        if (node._editingGroupId && !groupEntry(node._editingGroupId)) node._editingGroupId = null;
+        if (node._selectedGroupId && !groupEntry(node._selectedGroupId)) node._selectedGroupId = null;
+        const entry = groupEntry(node._editingGroupId);
+        level.textContent = `Edit level: ${entry ? entry.name || "(group)" : "Root"}`;
+        level.style.display = groupsEnabled() ? "" : "none";
+        exitGroup.style.display = groupsEnabled() && entry ? "" : "none";
+      }
       // All boxes under the point, top-first to match draw order: the active box is
       // drawn last (on top), then the rest front-most first (see stackOrder).
       function boxesAt(mN) {
         const baseRx = HANDLE / logW(), baseRy = HANDLE / logH();
         const res = [];
+        const direct = groupsEnabled() ? directBoxIndices() : null;
         for (const i of stackOrder()) {
           const b = node._boxes[i];
-          if (b.locked) continue;                          // locked regions aren't grabbable on the canvas
+          if (b.locked || (direct && !direct.has(i))) continue;                          // locked regions aren't grabbable on the canvas
           const rx = Math.min(baseRx, b.w / 3), ry = Math.min(baseRy, b.h / 3);  // shrink handles on small boxes so a central move zone remains
           const mode = rectHitTestN(mN.x, mN.y, b.x, b.y, b.x + b.w, b.y + b.h, rx, ry);
           if (mode) res.push({ index: i, mode });
         }
-        const ai = res.findIndex((c) => c.index === node._activeIdx);
+        if (groupsEnabled()) {
+          const entries = levelEntries().filter((entry) => entry.group);
+          for (const entry of (FRONT_FIRST ? [...entries].reverse() : entries)) {
+            const b = groupBounds(entry);
+            if (!b || mN.x < b.x || mN.x > b.x + b.w || mN.y < b.y || mN.y > b.y + b.h) continue;
+            const leaves = groupLeaves(entry);
+            if (leaves.some((i) => { const leaf = node._boxes[i]; return mN.x >= leaf.x && mN.x <= leaf.x + leaf.w && mN.y >= leaf.y && mN.y <= leaf.y + leaf.h; }) || node._selectedGroupId === entry.group)
+              res.push({ group: entry.group, mode: "move" });
+          }
+        }
+        res.sort((a, b) => {
+          const order = (c) => c.group ? groupLeaves(groupEntry(c.group))[0] : c.index;
+          return FRONT_FIRST ? order(a) - order(b) : order(b) - order(a);
+        });
+        const ai = res.findIndex((c) => c.group ? c.group === node._selectedGroupId : c.index === node._activeIdx && node._activeIdx >= 0);
         if (ai > 0) res.unshift(res.splice(ai, 1)[0]);
         return res;
       }
@@ -1259,8 +1334,9 @@ app.registerExtension({
       function titleAt(mN) {
         const px = mN.x * logW(), py = mN.y * logH();
         const rects = tagRects();
+        const direct = groupsEnabled() ? directBoxIndices() : null;
         for (const i of stackOrder()) {                    // front-most chip wins where chips overlap
-          if (node._boxes[i].locked) continue;             // locked badges aren't interactive
+          if (node._boxes[i].locked || (direct && !direct.has(i))) continue;             // locked badges aren't interactive
           const r = rects[i];
           if (r && px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) return i;
         }
@@ -1316,8 +1392,11 @@ app.registerExtension({
         if (ti !== null && !cycle) return { index: ti, mode: "move" };
         if (cycle && cands.length > 1) {
           // cycle over a stable order (boxesAt moves the active box to the front, which would otherwise ping-pong 2)
-          const ordered = [...cands].sort((a, b) => FRONT_FIRST ? a.index - b.index : b.index - a.index);
-          const pos = ordered.findIndex((c) => c.index === node._activeIdx);
+          const ordered = [...cands].sort((a, b) => {
+            const index = (c) => c.group ? groupLeaves(groupEntry(c.group))[0] : c.index;
+            return FRONT_FIRST ? index(a) - index(b) : index(b) - index(a);
+          });
+          const pos = ordered.findIndex((c) => c.group ? c.group === node._selectedGroupId : c.index === node._activeIdx);
           return ordered[(pos + 1) % ordered.length];
         }
         return cands.find((c) => c.index === node._activeIdx && c.mode !== "move") || cands[0];
@@ -1479,8 +1558,9 @@ app.registerExtension({
           ctx.fillStyle = `rgb(${g},${g},${g})`; ctx.fillRect(0, 0, W, H);
         }
         drawGuide(W, H);                                          // composition guide overlay
-        if (node._hideBoxes) return;                              // H: temporary background-only view
+        if (node._hideBoxes) { refreshLevel(); return; }          // H: temporary background-only view
         // selection highlight only when the editor is focused or the node is selected
+        refreshLevel();
         const showSel = node._focused || node._selected;
         const aIdx = showSel ? node._activeIdx : -1;
         const selSet = new Set(showSel ? node._selection : []);
@@ -1492,9 +1572,11 @@ app.registerExtension({
         const order = [...nonSel, ...selOthers];
         if (aIdx >= 0 && aIdx < node._boxes.length && onView(node._boxes[aIdx])) order.push(aIdx);
         const tagR = tagRects();                              // collision-avoided tag positions
-        const textB = textBlocks();                           // collision-avoided in-box text positions
+        const textB = textBlocks();
+        const direct = groupsEnabled() ? directBoxIndices() : null;
         for (const i of order) {
-          const b = node._boxes[i], active = i === aIdx, selected = selSet.has(i) && !b.locked;  // locked never shows as selected
+          const b = node._boxes[i], dimmed = direct && !direct.has(i);
+          const active = i === aIdx && !dimmed, selected = selSet.has(i) && !b.locked && !dimmed;  // locked never shows as selected
           const pal = (b.palette || []).filter(Boolean);
           const col = pal.length ? pal[0] : "#8c8c8c";       // box color = first palette color, else neutral grey
           const { x1, y1, x2, y2 } = toPx(b);
@@ -1505,17 +1587,18 @@ app.registerExtension({
             ctx.fillRect(x1, y1, w, h);
           }
           if (b.ref && !b.nobbox && spec.refs) drawRef(b, x1, y1, w, h);   // under the tint, outline and text
+          if (dimmed) ctx.globalAlpha = 0.45;
           const baseA = (node.properties.boxOpacity == null ? 14 : node.properties.boxOpacity) / 100;
           const fillA = Math.min(1, hovered ? baseA + 0.1 : baseA);   // box-color tint at the chosen opacity
           ctx.fillStyle = col + Math.round(fillA * 255).toString(16).padStart(2, "0");
-          ctx.fillRect(x1, y1, w, h);
+          if (!dimmed) ctx.fillRect(x1, y1, w, h);
           if (b.locked) ctx.setLineDash([3, 3]);             // locked: frozen on the canvas
           else if (b.nobbox) ctx.setLineDash([6, 4]);        // unplaced (no bbox in source)
           const lw = selected ? 2 : (hovered ? 1.5 : 1);
           ctx.strokeStyle = col; ctx.lineWidth = lw;
           ctx.strokeRect(x1 + lw / 2, y1 + lw / 2, w - lw, h - lw);  // inside the box so strip/badge align at y1
           ctx.setLineDash([]);
-          if (pal.length) {                                  // palette shown as a strip along the top edge
+          if (!dimmed && pal.length) {                                  // palette shown as a strip along the top edge
             const sw = w / pal.length, n = pal.length, sh = 7;
             for (let p = 0; p < n; p++) {
               const sx = x1 + Math.round(p * sw);
@@ -1552,12 +1635,27 @@ app.registerExtension({
           ctx.fillStyle = textOn(col);
           ctx.fillText(tr.tag, tr.x + 4, tr.y + 11);
           if (b.locked) { ctx.font = "11px sans-serif"; ctx.fillStyle = "#ddd"; ctx.fillText("🔒", tr.x + tr.w + 2, tr.y + 11); }  // lock symbol next to the badge
+          ctx.globalAlpha = 1;
           if (selected) {                                    // orange selection ring on top (above strip/tag): solid = primary, dashed = others
             const olw = active ? 2 : 1;
             ctx.strokeStyle = "#ff8c00"; ctx.lineWidth = olw;
             if (!active) ctx.setLineDash([5, 3]);
             ctx.strokeRect(x1 + olw / 2, y1 + olw / 2, w - olw, h - olw);
             ctx.setLineDash([]);
+          }
+        }
+        if (groupsEnabled()) {
+          for (const entry of levelEntries()) {
+            if (!entry.group) continue;
+            const b = groupBounds(entry);
+            if (!b) continue;
+            const { x1, y1, x2, y2 } = toPx(b);
+            const locked = groupLeaves(entry).some((i) => node._boxes[i].locked);
+            ctx.strokeStyle = showSel && node._selectedGroupId === entry.group ? "#ff8c00" : "#46b4e6";
+            ctx.lineWidth = showSel && node._selectedGroupId === entry.group ? 2 : 1;
+            ctx.setLineDash([5, 3]); ctx.strokeRect(x1, y1, x2 - x1, y2 - y1); ctx.setLineDash([]);
+            ctx.font = "bold 12px sans-serif"; ctx.fillStyle = ctx.strokeStyle;
+            ctx.fillText((entry.name || "(group)") + (locked ? " 🔒" : ""), x1 + 3, Math.max(12, y1 - 3));
           }
         }
         const apIdx = node._altPreview ?? -1;                 // Alt-held: ring the box an alt-click would select next
@@ -1694,6 +1792,7 @@ app.registerExtension({
       }
       // Replace the selection with a single box (used by clicks / programmatic selects).
       function selectOnly(idx) {
+        node._selectedGroupId = null;
         node._activeIdx = idx;
         node._selection = idx >= 0 ? new Set([idx]) : new Set();
       }
@@ -1719,7 +1818,8 @@ app.registerExtension({
         if (e.pointerType && e.pointerType !== "mouse") {
           const last = node._lastTap, now = e.timeStamp;
           if (hit && last && now - last.t < 350 && Math.abs(mN.x - last.x) < 0.03 && Math.abs(mN.y - last.y) < 0.03) {
-            node._lastTap = null; openInlineEditor(hit.index);
+            node._lastTap = null;
+            if (hit.group) enterGroup(hit.group); else openInlineEditor(hit.index);
             e.preventDefault(); e.stopPropagation(); return;
           }
           node._lastTap = { t: now, x: mN.x, y: mN.y };
@@ -1727,12 +1827,27 @@ app.registerExtension({
         node._pendingCollapse = -1;
         node._groupStart = null;
         if (e.shiftKey) {                              // shift-drag = marquee select; shift-click = toggle
-          startMarquee(mN, hit ? hit.index : -1);
+          startMarquee(mN, hit ? hit.group || hit.index : -1);
           e.preventDefault(); e.stopPropagation();
           return;
         }
-        node._clickSel = drawThrough(hit) ? hit.index : -1;   // draw, but a plain click selects that box (onUp)
+        node._clickSel = drawThrough(hit) ? hit.index : -1;
+        if (hit?.group) {
+          selectGroup(hit.group);
+          node._dragMode = "group-move";
+          const entry = groupEntry(hit.group);
+          if (!groupLeaves(entry).some((i) => node._boxes[i].locked)) {
+            node._groupStart = {};
+            for (const i of groupLeaves(entry)) if (!node._boxes[i].nobbox) node._groupStart[i] = { ...node._boxes[i] };
+          }
+          node._drawing = true; node._dragStartN = mN;
+          canvasEl.addEventListener("pointermove", onMove);
+          canvasEl.addEventListener("pointerup", onUp);
+          canvasEl.addEventListener("pointercancel", onUp);
+          e.preventDefault(); e.stopPropagation(); drawCanvas(); return;
+        }   // draw, but a plain click selects that box (onUp)
         if (hit && node._clickSel < 0) {
+          node._selectedGroupId = null;
           if (!node._selection.has(hit.index)) node._selection = new Set([hit.index]);  // outside selection → pick it
           else if (node._selection.size > 1) node._pendingCollapse = hit.index;          // click (no drag) collapses
           node._activeIdx = hit.index;
@@ -1749,8 +1864,7 @@ app.registerExtension({
           spec.initBox?.(nb, ed, node._viewPrev);           // e.g. join the row selected before a canvas switch
           node._viewPrev = null;
           appendRootBox(nb);
-          node._activeIdx = node._boxes.length - 1;
-          node._selection = new Set([node._activeIdx]);
+          selectOnly(node._boxes.length - 1);
           node._boxAtStart = { ...nb };
         }
         node._drawing = true;
@@ -1764,7 +1878,7 @@ app.registerExtension({
 
       // Hover targets: with Alt, preview what an alt-click would select next (the box under the current one).
       function hoverTargets(mN, alt, force) {
-        if (alt && !force) { const pick = pickForSelection(mN, true); return { ti: null, hb: null, ap: pick ? pick.index : -1, hit: null }; }
+        if (alt && !force) { const pick = pickForSelection(mN, true); return { ti: null, hb: null, ap: pick && !pick.group ? pick.index : -1, hit: pick?.group ? pick : null }; }
         const ti = force ? null : titleAt(mN);
         let hit = force ? null : hitTest(mN);
         if (drawThrough(hit)) hit = null;                   // a canvas-filling box's interior acts as empty canvas
@@ -1784,7 +1898,7 @@ app.registerExtension({
         const t = hoverTargets(mN, alt, force);
         applyHover(t);
         canvasEl.style.cursor = (alt && !force) ? (t.ap >= 0 ? "pointer" : "crosshair")
-          : (t.ti != null ? "pointer" : (t.hit ? (cursorForBboxMode(t.hit.mode) || "crosshair") : "crosshair"));
+          : (t.ti != null ? "pointer" : (t.hit ? (t.hit.group ? "move" : cursorForBboxMode(t.hit.mode) || "crosshair") : "crosshair"));
       });
       // Alt pressed/released without moving the mouse — refresh the preview from the last cursor position.
       node._altRefresh = (altDown) => {
@@ -1849,12 +1963,14 @@ app.registerExtension({
         e.preventDefault(); e.stopPropagation();
         const cands = boxesAt(mouseN(e));     // edit the active box if it's under the cursor, else topmost
         const target = cands.find((c) => c.index === node._activeIdx) || cands[0];
-        if (target) openInlineEditor(target.index);
+        if (target?.group) enterGroup(target.group);
+        else if (target) openInlineEditor(target.index);
       });
 
       // Snapshot the current selection (or the active box) for the clipboard.
       function copySelection() {
-        const idxs = node._selection.size ? [...node._selection].sort((a, b) => a - b)
+        const idxs = node._selectedGroupId ? groupLeaves(groupEntry(node._selectedGroupId))
+          : node._selection.size ? [...node._selection].sort((a, b) => a - b)
           : (node._activeIdx >= 0 ? [node._activeIdx] : []);
         return idxs.map((i) => JSON.parse(JSON.stringify(node._boxes[i])));
       }
@@ -1882,6 +1998,7 @@ app.registerExtension({
           spec.initBox?.(b, ed, null);                  // a copy is a new element (fresh id)
           appendRootBox(b);
         }
+        node._selectedGroupId = null;
         node._selection = new Set();
         for (let i = start; i < node._boxes.length; i++) node._selection.add(i);
         node._activeIdx = node._boxes.length - 1;
@@ -1899,13 +2016,13 @@ app.registerExtension({
         if ((e.key === "Delete" || e.key === "Backspace") && node._activeIdx >= 0) {
           e.preventDefault(); e.stopPropagation();
           removeSelected(); commit(); fitCanvas();      // removes all selected (or the active one)
-        } else if (ctrl && e.key === "c" && node._activeIdx >= 0) {
+        } else if (ctrl && e.key === "c" && (node._activeIdx >= 0 || node._selectedGroupId)) {
           e.preventDefault(); e.stopPropagation();
           copiedBoxes = copySelection();
         } else if (ctrl && e.key === "v" && copiedBoxes) {
           e.preventDefault(); e.stopPropagation();
           pasteBoxes();
-        } else if (ctrl && e.key === "d" && node._activeIdx >= 0) {
+        } else if (ctrl && e.key === "d" && (node._activeIdx >= 0 || node._selectedGroupId)) {
           e.preventDefault(); e.stopPropagation();
           copiedBoxes = copySelection();
           pasteBoxes();
@@ -1917,7 +2034,8 @@ app.registerExtension({
         const mN = mouseN(e);
         const dN = { x: mN.x - node._dragStartN.x, y: mN.y - node._dragStartN.y };
         if (Math.abs(dN.x) + Math.abs(dN.y) > 0.001) node._pendingCollapse = -1;  // it's a drag, not a click
-        if (node._dragMode === "move" && node._groupStart) {
+        if (node._dragMode === "group-move" && !node._groupStart) return;
+        if ((node._dragMode === "move" || node._dragMode === "group-move") && node._groupStart) {
           let dx = dN.x, dy = dN.y;                   // clamp delta so the whole group stays in bounds
           for (const i in node._groupStart) {
             const s = node._groupStart[i];
@@ -1932,7 +2050,7 @@ app.registerExtension({
           for (const i in node._groupStart) {
             const s = node._groupStart[i];
             node._boxes[i] = { ...s, x: s.x + dx, y: s.y + dy };
-            delete node._boxes[i].nobbox;
+            if (node._dragMode !== "group-move") delete node._boxes[i].nobbox;
           }
           drawCanvas(); updateBboxLabel();
           return;
@@ -1956,6 +2074,7 @@ app.registerExtension({
           drawCanvas(); updateBboxLabel();
           return;
         }
+        if (node._dragMode === "group-move") return;
         const nb = snapBox(applyDrag(node._dragMode, node._boxAtStart, dN), node._dragMode);
         delete nb.nobbox;            // moving/resizing places the element (gives it a bbox)
         node._boxes[node._activeIdx] = nb;
@@ -1991,6 +2110,7 @@ app.registerExtension({
       }
       function startMarquee(mN, startHit) {
         node._marquee = { x0: mN.x, y0: mN.y, x: mN.x, y: mN.y };
+        node._marqueeGroup = null;
         node._marqueeBase = new Set(node._selection);   // additive: marquee unions with what's selected
         node._marqueeStartHit = startHit;               // for the shift-click (no drag) toggle fallback
         node._marqueeActive = false;
@@ -2008,7 +2128,12 @@ app.registerExtension({
         if (node._marqueeActive) {
           const r = marqueeRect();
           const sel = new Set(node._marqueeBase);
-          node._boxes.forEach((b, i) => { if (!b.locked && onView(b) && rectsOverlap(r, b)) sel.add(i); });   // marquee skips locked
+          const direct = groupsEnabled() ? directBoxIndices() : null;
+          node._boxes.forEach((b, i) => { if (!b.locked && onView(b) && (!direct || direct.has(i)) && rectsOverlap(r, b)) sel.add(i); });
+          if (groupsEnabled()) for (const entry of levelEntries()) {
+            const bounds = entry.group && groupBounds(entry);
+            if (bounds && rectsOverlap(r, bounds)) node._marqueeGroup = entry.group;
+          }   // marquee skips locked
           node._selection = sel;
           if (node._activeIdx < 0 || !sel.has(node._activeIdx)) node._activeIdx = sel.size ? [...sel][0] : node._activeIdx;
         }
@@ -2018,7 +2143,12 @@ app.registerExtension({
         canvasEl.removeEventListener("pointermove", onMarqueeMove);
         canvasEl.removeEventListener("pointerup", onMarqueeUp);
         canvasEl.removeEventListener("pointercancel", onMarqueeUp);
-        if (!node._marqueeActive && node._marqueeStartHit >= 0) {   // shift-click on a box → toggle it
+        if (node._marqueeActive && node._marqueeGroup) selectGroup(node._marqueeGroup);
+        if (!node._marqueeActive && typeof node._marqueeStartHit === "string") {
+          if (node._selectedGroupId === node._marqueeStartHit) selectOnly(-1);
+          else selectGroup(node._marqueeStartHit);
+        }
+        if (!node._marqueeActive && typeof node._marqueeStartHit === "number" && node._marqueeStartHit >= 0) {   // shift-click on a box → toggle it
           const idx = node._marqueeStartHit;
           if (node._selection.has(idx) && node._selection.size > 1) {
             node._selection.delete(idx);
@@ -2027,8 +2157,8 @@ app.registerExtension({
             node._selection.add(idx); node._activeIdx = idx;
           }
         }
-        node._marquee = null; node._marqueeActive = false;
-        if (node._activeIdx >= 0 && !node._selection.has(node._activeIdx)) {
+        node._marquee = null; node._marqueeGroup = null; node._marqueeActive = false;
+        if (!node._selectedGroupId && node._activeIdx >= 0 && !node._selection.has(node._activeIdx)) {
           node._activeIdx = node._selection.size ? [...node._selection][0] : -1;
         }
         commit();
@@ -2198,6 +2328,12 @@ app.registerExtension({
         hdr.textContent = NOUN[0].toUpperCase() + NOUN.slice(1) + "s — top = front · click select";
         // Top of the list = front-most (drawn on top), whichever end of the array that is; see stackOrder.
         menu.appendChild(hdr);
+        const exitBtn = document.createElement("button");
+        exitBtn.className = "kjideo-btn"; exitBtn.textContent = "Exit group";
+        if (groupsEnabled() && node._editingGroupId) {
+          menu.appendChild(exitBtn);
+          exitBtn.addEventListener("click", () => { exitGroup.click(); buildRows(); });
+        }
         const groupBtn = document.createElement("button");
         groupBtn.className = "kjideo-btn";
         groupBtn.textContent = "Group selected…";
@@ -2270,7 +2406,7 @@ app.registerExtension({
             ghost?.remove();
             document.body.classList.remove("kjideo-dragging");
             if (!dragging) {
-              if (ue.type === "pointerup" && !source.group) row.click();
+              if (ue.type === "pointerup") row.click();
               return;
             }
             row.classList.remove("dragging"); row._dragged = true;
@@ -2318,9 +2454,23 @@ app.registerExtension({
               ungroup.className = "kjideo-lbtn"; ungroup.textContent = "Ungroup"; ungroup.title = "Keep boxes in their current order";
               ungroup.addEventListener("click", (e) => {
                 e.stopPropagation();
+                if (node._editingGroupId === entry.group) node._editingGroupId = treeLocation(entry)?.parent?.group || null;
+                if (node._selectedGroupId === entry.group) node._selectedGroupId = null;
                 ungroupTreeEntry(entry); commit(); buildRows();
               });
+              const enter = document.createElement("button");
+              enter.className = "kjideo-lbtn"; enter.textContent = "Enter group";
+              enter.addEventListener("click", (e) => { e.stopPropagation(); enterGroup(entry.group); buildRows(); });
+              if (groupsEnabled()) row.append(enter);
               row.append(rename, ungroup);
+              row.addEventListener("click", () => {
+                if (row._dragged) { row._dragged = false; return; }
+                if (!groupsEnabled()) return;
+                const parent = treeLocation(entry)?.parent;
+                selectGroup(parent && parent.group !== node._editingGroupId ?
+                  (levelEntries().find((item) => item === parent || containsTreeEntry(item, entry))?.group || parent.group) : entry.group);
+                canvasEl.focus(); commit(); buildRows();
+              });
               toggle.addEventListener("click", (e) => {
                 e.stopPropagation();
                 if (node._collapsedGroups.has(entry.group)) node._collapsedGroups.delete(entry.group);
@@ -2376,7 +2526,11 @@ app.registerExtension({
 
             row.addEventListener("click", () => {
               if (row._dragged) { row._dragged = false; return; }
-              selectOnly(node._boxes.findIndex((box) => box.$kj.id === entry.box));
+              const parent = treeLocation(entry)?.parent;
+              if (groupsEnabled() && parent?.group !== node._editingGroupId) {
+                if (parent) selectGroup(levelEntries().find((item) => item === parent || containsTreeEntry(item, entry))?.group || parent.group);
+                else selectOnly(node._boxes.findIndex((box) => box.$kj.id === entry.box));
+              } else selectOnly(node._boxes.findIndex((box) => box.$kj.id === entry.box));
               canvasEl.focus();
               commit();
               groupBtn.disabled = !selectedRootEntries().length;
