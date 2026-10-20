@@ -2078,6 +2078,7 @@ app.registerExtension({
         return b.desc || "";
       }
       function selectedRootEntries() {
+        if (spec.views && node._view !== 0) return [];
         const ids = new Set([...node._selection].filter((i) => node._boxes[i] && !node._boxes[i].locked && onView(node._boxes[i]))
           .map((i) => node._boxes[i].$kj.id));
         if (ids.size !== node._selection.size) return [];
@@ -2162,7 +2163,7 @@ app.registerExtension({
         groupBtn.textContent = "Group selected…";
         groupBtn.title = "Select two or more root boxes with Shift-click or Shift-drag";
         groupBtn.style.margin = "2px 6px 6px";
-        menu.appendChild(groupBtn);
+        if (!spec.views || node._view === 0) menu.appendChild(groupBtn);
         const list = document.createElement("div");
         menu.appendChild(list);
         node._layerMenu = menu;
@@ -2196,7 +2197,7 @@ app.registerExtension({
         function buildRows() {
           list.innerHTML = "";
           const rows = layerRows();
-          const rootOnly = node._tree.every((entry) => entry.box);
+          const rootOnly = visibleRootEntries().every((entry) => entry.box);
           groupBtn.disabled = !selectedRootEntries().length;
           hdr.textContent = NOUN[0].toUpperCase() + NOUN.slice(1) + (rootOnly
             ? "s — top = front · click select · drag reorder" : "s — top = front · click select · expand groups");
@@ -2351,7 +2352,7 @@ app.registerExtension({
                   const activeId = node._boxes[node._activeIdx]?.$kj.id;
                   const order = Array.from(list.querySelectorAll(".kjideo-lrow")).map((el) => el._entry);
                   const byId = new Map(node._boxes.map((b) => [b.$kj.id, b]));
-                  const slots = node._tree.map((entry, i) => onView(byId.get(entry.box)) ? i : -1).filter((i) => i >= 0);
+                  const slots = node._tree.map((entry, i) => entry.box && onView(byId.get(entry.box)) ? i : -1).filter((i) => i >= 0);
                   if (order.length === slots.length) {
                     (FRONT_FIRST ? order : order.reverse()).forEach((entry, i) => { node._tree[slots[i]] = entry; });
                     syncBoxesFromTree();
