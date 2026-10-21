@@ -1246,7 +1246,9 @@ app.registerExtension({
         return { x, y, w: Math.max(...boxes.map((b) => b.x + b.w)) - x,
           h: Math.max(...boxes.map((b) => b.y + b.h)) - y };
       }
-      function groupBounds(entry) { return boundsFor(groupLeaves(entry)); }
+      function groupBounds(entry) {
+        return boundsFor(groupLeaves(entry).filter((i) => !(node._drawing && node._dragMode === "draw" && i === node._activeIdx)));
+      }
       function collectiveBounds() {
         if (groupsEnabled() && node._selectedGroupId) return groupBounds(groupEntry(node._selectedGroupId));
         return node._selection.size > 1 ? boundsFor([...node._selection]) : null;
@@ -1955,6 +1957,10 @@ app.registerExtension({
           }
         } else {
           node._dragMode = "draw";
+          const editing = groupsEnabled() && groupEntry(node._editingGroupId);
+          const bounds = editing && groupBounds(editing);
+          node._drawOutsideGroup = !e.ctrlKey && !e.metaKey && !e.altKey && bounds &&
+            (mN.x < bounds.x || mN.x > bounds.x + bounds.w || mN.y < bounds.y || mN.y > bounds.y + bounds.h);
           const nb = { x: mN.x, y: mN.y, w: 0, h: 0, ...spec.blankBox() };
           if (spec.views) nb.view = node._view;
           spec.initBox?.(nb, ed, node._viewPrev);           // e.g. join the row selected before a canvas switch
@@ -2187,9 +2193,11 @@ app.registerExtension({
         node._boxes[node._activeIdx] = nb;
         drawCanvas(); updateBboxLabel();
       }
-      function onUp() {
+      function onUp(e) {
         if (!node._drawing) return;
         node._drawing = false;
+        const outside = node._drawOutsideGroup;
+        node._drawOutsideGroup = false;
         canvasEl.removeEventListener("pointermove", onMove);
         canvasEl.removeEventListener("pointerup", onUp);
         canvasEl.removeEventListener("pointercancel", onUp);
@@ -2199,6 +2207,11 @@ app.registerExtension({
           removeTreeBox(b.$kj.id);
           node._boxes.splice(node._activeIdx, 1);
           selectOnly(node._clickSel ?? -1);            // a click inside a canvas-filling box selects it
+          if (outside && e.type === "pointerup" && node._clickSel < 0) {
+            const mN = mouseN(e), bounds = groupBounds(groupEntry(node._editingGroupId));
+            if (bounds && (mN.x < bounds.x || mN.x > bounds.x + bounds.w || mN.y < bounds.y || mN.y > bounds.y + bounds.h))
+              node._editingGroupId = treeLocation(groupEntry(node._editingGroupId))?.parent?.group || null;
+          }
         } else if (node._pendingCollapse >= 0) {     // click (no drag) on a group member → keep only it
           selectOnly(node._pendingCollapse);
         }
