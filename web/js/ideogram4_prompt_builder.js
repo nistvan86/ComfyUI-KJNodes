@@ -372,6 +372,8 @@ function injectStyle() {
     .kjideo-row { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
     .kjideo-btn { background:#333; border:1px solid #555; border-radius:4px; color:#bbb; font:11px sans-serif; cursor:pointer; padding:2px 8px; line-height:16px; white-space:nowrap; flex-shrink:0; }
     .kjideo-btn:hover { border-color:#46b4e6; color:#fff; }
+    .kjideo-btn:disabled { opacity:0.45; cursor:default; }
+    .kjideo-btn:disabled:hover { border-color:#555; color:#bbb; }
     .kjideo-btn.active { border-color:#46b4e6; color:#46b4e6; background:#2a3a42; }
     .kjideo-area { width:100%; box-sizing:border-box; background:#1d1d1d; border:1px solid #444; border-radius:4px; color:#ddd; font:13px monospace; padding:4px 6px; resize:none; min-height:36px; flex:1 1 auto; }
     .kjideo-sw { width:20px; height:20px; border:1px solid #666; border-radius:3px; cursor:pointer; flex-shrink:0; position:relative; touch-action:none; transition:transform .18s ease, box-shadow .12s ease, opacity .12s ease; }
@@ -1685,6 +1687,18 @@ app.registerExtension({
           }
         }
         if (groupsEnabled()) {
+          const editing = groupEntry(node._editingGroupId);
+          const bounds = editing && groupBounds(editing);
+          if (bounds) {
+            const { x1, y1, x2, y2 } = toPx(bounds);
+            const left = Math.max(0, Math.min(W, x1)), right = Math.max(0, Math.min(W, x2));
+            const top = Math.max(0, Math.min(H, y1)), bottom = Math.max(0, Math.min(H, y2));
+            ctx.fillStyle = "rgba(0,0,0,0.18)";
+            ctx.fillRect(0, 0, W, top);
+            ctx.fillRect(0, bottom, W, H - bottom);
+            ctx.fillRect(0, top, left, bottom - top);
+            ctx.fillRect(right, top, W - right, bottom - top);
+          }
           for (const entry of levelEntries()) {
             if (!entry.group) continue;
             const b = groupBounds(entry);
@@ -1696,6 +1710,13 @@ app.registerExtension({
             ctx.setLineDash([5, 3]); ctx.strokeRect(x1, y1, x2 - x1, y2 - y1); ctx.setLineDash([]);
             ctx.font = "bold 12px sans-serif"; ctx.fillStyle = ctx.strokeStyle;
             ctx.fillText((entry.name || "(group)") + (locked ? " 🔒" : ""), x1 + 3, Math.max(12, y1 - 3));
+          }
+          if (bounds) {
+            const { x1, y1, x2, y2 } = toPx(bounds);
+            ctx.strokeStyle = "#9bcfe8"; ctx.lineWidth = 2;
+            ctx.setLineDash([8, 4]); ctx.strokeRect(x1, y1, x2 - x1, y2 - y1); ctx.setLineDash([]);
+            ctx.font = "bold 12px sans-serif"; ctx.fillStyle = ctx.strokeStyle;
+            ctx.fillText(editing.name || "(group)", x1 + 3, Math.max(12, y1 - 3));
           }
         }
         const collective = showSel && collectiveBounds();
