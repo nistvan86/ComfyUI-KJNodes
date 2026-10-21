@@ -2568,20 +2568,15 @@ app.registerExtension({
                 if (node._selectedGroupId === entry.group) node._selectedGroupId = null;
                 ungroupTreeEntry(entry); commit(); buildRows();
               });
-              const enter = document.createElement("button");
-              enter.className = "kjideo-lbtn"; enter.textContent = "Enter group";
-              enter.addEventListener("click", (e) => { e.stopPropagation(); enterGroup(entry.group); buildRows(); });
-              if (groupsEnabled()) row.append(enter);
               row.append(rename, ungroup);
               row.addEventListener("click", (e) => {
                 if (row._dragged) { row._dragged = false; return; }
                 if (e.ctrlKey || e.metaKey) { toggleMenuEntry(entry); return; }
                 menuSelected.clear(); menuSelected.add(entry);
                 if (!groupsEnabled()) { buildRows(); return; }
-                const parent = treeLocation(entry)?.parent;
-                selectGroup(parent && parent.group !== node._editingGroupId ?
-                  (levelEntries().find((item) => item === parent || containsTreeEntry(item, entry))?.group || parent.group) : entry.group);
-                canvasEl.focus(); commit(); buildRows();
+                canvasEl.focus();
+                enterGroup(entry.group);
+                buildRows();
               });
               toggle.addEventListener("click", (e) => {
                 e.stopPropagation();
@@ -2640,11 +2635,8 @@ app.registerExtension({
               if (row._dragged) { row._dragged = false; return; }
               if (e.ctrlKey || e.metaKey) { toggleMenuEntry(entry); return; }
               menuSelected.clear(); menuSelected.add(entry);
-              const parent = treeLocation(entry)?.parent;
-              if (groupsEnabled() && parent?.group !== node._editingGroupId) {
-                if (parent) selectGroup(levelEntries().find((item) => item === parent || containsTreeEntry(item, entry))?.group || parent.group);
-                else selectOnly(node._boxes.findIndex((box) => box.$kj.id === entry.box));
-              } else selectOnly(node._boxes.findIndex((box) => box.$kj.id === entry.box));
+              if (groupsEnabled()) node._editingGroupId = treeLocation(entry)?.parent?.group || null;
+              selectOnly(node._boxes.findIndex((box) => box.$kj.id === entry.box));
               canvasEl.focus();
               commit();
               updateGroupButton();
