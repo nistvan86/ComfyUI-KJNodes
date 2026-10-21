@@ -1782,6 +1782,15 @@ app.registerExtension({
         ensureBoxIds(node._boxes);
         node._tree.push({ box: box.$kj.id });
       }
+      function appendDrawBox(box) {
+        const group = groupsEnabled() && groupEntry(node._editingGroupId);
+        if (!group) { appendRootBox(box); return; }
+        node._boxes.push(box);
+        ensureBoxIds(node._boxes);
+        if (FRONT_FIRST) group.children.push({ box: box.$kj.id });
+        else group.children.unshift({ box: box.$kj.id });
+        syncBoxesFromTree();
+      }
       function removeTreeBox(id, entries = node._tree) {
         for (let i = entries.length - 1; i >= 0; i--) {
           const entry = entries[i];
@@ -1929,8 +1938,8 @@ app.registerExtension({
           if (spec.views) nb.view = node._view;
           spec.initBox?.(nb, ed, node._viewPrev);           // e.g. join the row selected before a canvas switch
           node._viewPrev = null;
-          appendRootBox(nb);
-          selectOnly(node._boxes.length - 1);
+          appendDrawBox(nb);
+          selectOnly(node._boxes.findIndex((box) => box.$kj.id === nb.$kj.id));
           node._boxAtStart = { ...nb };
         }
         node._drawing = true;
