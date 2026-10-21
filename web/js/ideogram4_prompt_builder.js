@@ -384,9 +384,11 @@ function injectStyle() {
     .kjideo-bbox:focus { border-color:#46b4e6; outline:none; color:#fff; }
     .kjideo-menu { position:fixed; z-index:10000; background:#262626; border:1px solid #555; border-radius:6px; padding:4px; box-shadow:0 6px 20px rgba(0,0,0,0.55); font:12px sans-serif; color:#ddd; max-height:60vh; overflow-y:auto; min-width:210px; max-width:340px; }
     .kjideo-mhdr { font:11px sans-serif; color:#888; padding:2px 6px 4px; user-select:none; }
+    .kjideo-crumb { border:0; background:none; color:#9bcfe8; cursor:pointer; padding:0 2px; font:inherit; }
+    .kjideo-crumb:hover { text-decoration:underline; }
     .kjideo-lrow { display:flex; align-items:center; gap:6px; padding:3px 5px; border-radius:4px; cursor:move; user-select:none; touch-action:none; transition:transform .18s ease, box-shadow .12s ease, opacity .12s ease, background .12s; }
     .kjideo-lrow:hover { background:#333; }
-    .kjideo-lrow.active { background:#2a3a42; box-shadow:inset 0 0 0 1px #46b4e6; }
+    .kjideo-lrow.active, .kjideo-lrow.menu-selected { background:#2a3a42; box-shadow:inset 0 0 0 1px #46b4e6; }
     .kjideo-lrow.dragging { opacity:.4; }
     .kjideo-drag-ghost { position:fixed; z-index:10001; box-sizing:border-box; pointer-events:none; background:#333; border-radius:4px; box-shadow:0 0 0 2px #46b4e6, 0 6px 16px #0008; opacity:.95; }
     .kjideo-drag-ghost .kjideo-lrow { transition:none; }
@@ -796,7 +798,7 @@ app.registerExtension({
       stopProp(viewSel);
       viewSel.addEventListener("change", () => switchView(parseInt(viewSel.value, 10)));
       const level = document.createElement("span");
-      level.style.cssText = "flex:0 0 auto;";
+      level.style.cssText = "flex:0 1 auto; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;";
       const exitGroup = document.createElement("button");
       exitGroup.className = "kjideo-btn"; exitGroup.textContent = "Exit group";
       exitGroup.addEventListener("click", () => {
@@ -1271,7 +1273,31 @@ app.registerExtension({
         if (node._editingGroupId && !groupEntry(node._editingGroupId)) node._editingGroupId = null;
         if (node._selectedGroupId && !groupEntry(node._selectedGroupId)) node._selectedGroupId = null;
         const entry = groupEntry(node._editingGroupId);
-        level.textContent = `Edit level: ${entry ? entry.name || "(group)" : "Root"}`;
+        const ancestors = [];
+        for (let current = entry; current; current = treeLocation(current)?.parent) ancestors.unshift(current);
+        const crumbs = [{ group: null, name: "Root" }, ...ancestors.map((group) => ({ group: group.group, name: group.name || "(group)" }))];
+        const signature = JSON.stringify(crumbs);
+        if (level._signature !== signature) {
+          level._signature = signature;
+          level.replaceChildren();
+          for (const [i, crumb] of crumbs.entries()) {
+            if (i) level.appendChild(document.createTextNode(" › "));
+            if (i === crumbs.length - 1) {
+              const label = document.createElement("span");
+              label.textContent = crumb.name;
+              level.appendChild(label);
+            } else {
+              const link = document.createElement("button");
+              link.className = "kjideo-crumb";
+              link.textContent = crumb.name;
+              link.title = `Edit ${crumb.name}`;
+              stopProp(link);
+              link.addEventListener("click", () => { node._editingGroupId = crumb.group; selectOnly(-1); commit(); });
+              level.appendChild(link);
+            }
+          }
+          level.title = crumbs.map((crumb) => crumb.name).join(" › ");
+        }
         level.style.display = groupsEnabled() ? "" : "none";
         exitGroup.style.display = groupsEnabled() && entry ? "" : "none";
       }
@@ -1727,14 +1753,29 @@ app.registerExtension({
         const valid = (entries) => Array.isArray(entries) && entries.every((entry) => {
           if (!entry || typeof entry !== "object") return false;
           if (typeof entry.box === "string") return !entry.group && !entry.children;
-          if (typeof entry.group !== "string" || !entry.group || groups.has(entry.group) ||
+          if (typeof entry.group !== "string" || !entry.group ||
               typeof entry.name !== "string" || typeof entry.view !== "number") return false;
           groups.add(entry.group);
           return valid(entry.children);
         });
         const leaves = Array.isArray(savedTree) && valid(savedTree) ? treeBoxIds(savedTree) : [];
-        node._tree = leaves.length === ids.length && leaves.every((id, i) => id === ids[i])
-          ? savedTree : ids.map((id) => ({ box: id }));
+        if (Array.isArray(savedTree) && leaves.length === ids.length && new Set(leaves).size === ids.length && leaves.every((id) => ids.includes(id))) {
+          const seen = new Set();
+          const fixGroupIds = (entries) => {
+            for (const entry of entries) {
+              if (!entry.children) continue;
+              if (seen.has(entry.group)) {
+                do { entry.group = `group_${node._nextEditorId++}`; } while (groups.has(entry.group));
+                groups.add(entry.group);
+              }
+              seen.add(entry.group);
+              fixGroupIds(entry.children);
+            }
+          };
+          fixGroupIds(savedTree);
+          node._tree = savedTree;
+          syncBoxesFromTree();
+        } else node._tree = ids.map((id) => ({ box: id }));
       }
       function appendRootBox(box) {
         node._boxes.push(box);
@@ -1779,7 +1820,7 @@ app.registerExtension({
         };
       }
 
-      function commit() { serialize(); renderPanel(); drawCanvas(); updateTokens(); flushChange(); }  // flush so canvas edits persist without a defocus
+      function commit() { node.properties.kjTree = node._tree; serialize(); renderPanel(); drawCanvas(); updateTokens(); flushChange(); }  // flush so canvas edits persist without a defocus
       // Live text edit: persist + repaint + token count, without rebuilding the panel.
       function touch() { serialize(); drawCanvas(); updateTokens(); }
       // Set a box field; with spec.linkKey the box's twins on other canvases follow (renaming the key renames them).
@@ -2253,7 +2294,7 @@ app.registerExtension({
         const ids = new Set([...node._selection].filter((i) => node._boxes[i] && !node._boxes[i].locked && onView(node._boxes[i]))
           .map((i) => node._boxes[i].$kj.id));
         if (ids.size !== node._selection.size) return [];
-        const entries = node._tree.filter((entry) => entry.box && ids.has(entry.box));
+        const entries = (node._editingGroupId ? levelEntries() : node._tree).filter((entry) => entry.box && ids.has(entry.box));
         return entries.length === ids.size && entries.length >= 2 ? entries : [];
       }
       function restoreBoxSelection(ids, activeId) {
@@ -2261,18 +2302,23 @@ app.registerExtension({
         node._activeIdx = node._boxes.findIndex((b) => b.$kj.id === activeId);
         if (node._activeIdx < 0) node._activeIdx = node._selection.size ? [...node._selection][0] : -1;
       }
-      function groupSelected(name) {
-        const entries = selectedRootEntries();
-        if (!entries.length) return false;
+      function groupSelected(name, entries = selectedRootEntries()) {
+        if (entries.length < 2) return false;
+        const location = treeLocation(entries[0]);
+        if (!location || entries.some((entry) => treeLocation(entry)?.entries !== location.entries)) return false;
+        const siblings = location.entries;
         const activeId = node._boxes[node._activeIdx]?.$kj.id;
-        const ids = new Set(entries.map((entry) => entry.box));
-        const positions = entries.map((entry) => node._tree.indexOf(entry));
+        const ids = new Set([...node._selection].map((i) => node._boxes[i]?.$kj.id));
+        const selected = new Set(entries);
+        const positions = entries.map((entry) => siblings.indexOf(entry));
         const front = FRONT_FIRST ? Math.min(...positions) : Math.max(...positions);
         const insertAt = front - positions.filter((i) => i < front).length;
-        node._tree = node._tree.filter((entry) => !ids.has(entry.box));
+        const children = siblings.filter((entry) => selected.has(entry));
+        siblings.splice(0, siblings.length, ...siblings.filter((entry) => !selected.has(entry)));
+        const hasGroup = (entries, id) => entries.some((entry) => entry.group === id || entry.children && hasGroup(entry.children, id));
         let group;
-        do { group = `group_${node._nextEditorId++}`; } while (node._tree.some((entry) => entry.group === group));
-        node._tree.splice(insertAt, 0, { group, name, view: node._view, children: entries });
+        do { group = `group_${node._nextEditorId++}`; } while (hasGroup(node._tree, group));
+        siblings.splice(insertAt, 0, { group, name, view: node._view, children });
         syncBoxesFromTree();
         restoreBoxSelection(ids, activeId);
         return true;
@@ -2373,25 +2419,43 @@ app.registerExtension({
         const groupBtn = document.createElement("button");
         groupBtn.className = "kjideo-btn";
         groupBtn.textContent = "Group selected…";
-        groupBtn.title = "Select two or more root boxes with Shift-click or Shift-drag";
+        groupBtn.title = "Ctrl/Cmd-click two or more sibling rows, or select root boxes on the canvas";
         groupBtn.style.margin = "2px 6px 6px";
         if (!spec.views || node._view === 0) menu.appendChild(groupBtn);
         const list = document.createElement("div");
         menu.appendChild(list);
         node._layerMenu = menu;
+        const menuSelected = new Set();
+        const groupEntries = () => {
+          if (!menuSelected.size) return selectedRootEntries();
+          if (menuSelected.size < 2 || (spec.views && node._view !== 0)) return [];
+          const entries = [...menuSelected];
+          const parent = treeLocation(entries[0]);
+          return parent && entries.every((entry) => treeLocation(entry)?.entries === parent.entries && treeEntryView(entry) === node._view) ? entries : [];
+        };
+        const updateGroupButton = () => { groupBtn.disabled = !groupEntries().length; };
 
         groupBtn.addEventListener("click", (e) => {
           e.stopPropagation();
-          const entries = selectedRootEntries();
+          const entries = groupEntries();
           if (!entries.length) return;
-          const positions = entries.map((entry) => node._tree.indexOf(entry));
+          const siblings = treeLocation(entries[0]).entries;
+          const positions = entries.map((entry) => siblings.indexOf(entry));
           if (Math.max(...positions) - Math.min(...positions) + 1 !== entries.length &&
               !window.confirm("These boxes are not adjacent. Grouping moves them together at the front-most selected position and changes layer order. Continue?")) return;
           const name = window.prompt("Group name:", "")?.trim();
-          if (name && groupSelected(name)) { commit(); buildRows(); }
+          if (name && groupSelected(name, entries)) { menuSelected.clear(); commit(); buildRows(); }
         });
+        function toggleMenuEntry(entry) {
+          if (menuSelected.size && treeLocation([...menuSelected][0])?.entries !== treeLocation(entry)?.entries) menuSelected.clear();
+          if (menuSelected.has(entry)) menuSelected.delete(entry);
+          else menuSelected.add(entry);
+          for (const row of list.querySelectorAll(".kjideo-lrow"))
+            row.classList.toggle("menu-selected", menuSelected.has(row._entry));
+          updateGroupButton();
+        }
         function startTreeReorder(e, row, source) {
-          if (e.button !== 0 || e.target.closest("button")) return;
+          if (e.button !== 0 || e.ctrlKey || e.metaKey || e.target.closest("button")) return;
           e.preventDefault(); e.stopPropagation();
           const x = e.clientX, y = e.clientY;
           let dragging = false, drop = null, ghost = null;
@@ -2456,7 +2520,8 @@ app.registerExtension({
           list.innerHTML = "";
           const rows = layerRows();
           const rootOnly = visibleRootEntries().every((entry) => entry.box);
-          groupBtn.disabled = !selectedRootEntries().length;
+          for (const entry of menuSelected) if (!treeLocation(entry)) menuSelected.delete(entry);
+          updateGroupButton();
           hdr.textContent = NOUN[0].toUpperCase() + NOUN.slice(1) + "s — top = front · drag reorder";
           if (!rows.length) {
             const empty = document.createElement("div");
@@ -2469,7 +2534,7 @@ app.registerExtension({
             row._depth = depth;
             row.style.paddingLeft = (5 + depth * 14) + "px";
             if (entry.group) {
-              row.className = "kjideo-lrow kjideo-grow";
+              row.className = "kjideo-lrow kjideo-grow" + (menuSelected.has(entry) ? " menu-selected" : "");
               row._entry = entry;
               const toggle = document.createElement("button");
               toggle.className = "kjideo-lbtn";
@@ -2499,9 +2564,11 @@ app.registerExtension({
               enter.addEventListener("click", (e) => { e.stopPropagation(); enterGroup(entry.group); buildRows(); });
               if (groupsEnabled()) row.append(enter);
               row.append(rename, ungroup);
-              row.addEventListener("click", () => {
+              row.addEventListener("click", (e) => {
                 if (row._dragged) { row._dragged = false; return; }
-                if (!groupsEnabled()) return;
+                if (e.ctrlKey || e.metaKey) { toggleMenuEntry(entry); return; }
+                menuSelected.clear(); menuSelected.add(entry);
+                if (!groupsEnabled()) { buildRows(); return; }
                 const parent = treeLocation(entry)?.parent;
                 selectGroup(parent && parent.group !== node._editingGroupId ?
                   (levelEntries().find((item) => item === parent || containsTreeEntry(item, entry))?.group || parent.group) : entry.group);
@@ -2519,7 +2586,7 @@ app.registerExtension({
               continue;
             }
             const b = node._boxes[i];
-            row.className = "kjideo-lrow" + (i === node._activeIdx ? " active" : "");
+            row.className = "kjideo-lrow" + (i === node._activeIdx ? " active" : "") + (menuSelected.has(entry) ? " menu-selected" : "");
             row._entry = entry;
             const sw = document.createElement("div");
             sw.className = "kjideo-lsw";
@@ -2560,8 +2627,10 @@ app.registerExtension({
               commit(); buildRows();
             });
 
-            row.addEventListener("click", () => {
+            row.addEventListener("click", (e) => {
               if (row._dragged) { row._dragged = false; return; }
+              if (e.ctrlKey || e.metaKey) { toggleMenuEntry(entry); return; }
+              menuSelected.clear(); menuSelected.add(entry);
               const parent = treeLocation(entry)?.parent;
               if (groupsEnabled() && parent?.group !== node._editingGroupId) {
                 if (parent) selectGroup(levelEntries().find((item) => item === parent || containsTreeEntry(item, entry))?.group || parent.group);
@@ -2569,8 +2638,11 @@ app.registerExtension({
               } else selectOnly(node._boxes.findIndex((box) => box.$kj.id === entry.box));
               canvasEl.focus();
               commit();
-              groupBtn.disabled = !selectedRootEntries().length;
-              for (const r of list.querySelectorAll(".kjideo-lrow")) r.classList.toggle("active", r._entry === entry);
+              updateGroupButton();
+              for (const r of list.querySelectorAll(".kjideo-lrow")) {
+                r.classList.toggle("menu-selected", r._entry === entry);
+                r.classList.toggle("active", r._entry === entry);
+              }
             });
             dup.addEventListener("click", (e) => {
               e.stopPropagation();
@@ -2588,7 +2660,7 @@ app.registerExtension({
             });
             // drag-reorder (vertical FLIP, mirrors the palette swatch reorder)
             if (rootOnly) row.addEventListener("pointerdown", (e) => {
-              if (e.button !== 0 || e.target === lock || e.target === dup || e.target === del) return;
+              if (e.button !== 0 || e.ctrlKey || e.metaKey || e.target === lock || e.target === dup || e.target === del) return;
               e.preventDefault(); e.stopPropagation();
               const sx = e.clientX, sy = e.clientY;
               let dragging = false;
@@ -3197,6 +3269,8 @@ app.registerExtension({
       chainCallback(node, "onSerialize", function (o) {
         if (!o) return;
         const p = node.properties;
+        p.kjTree = node._tree;
+        o.properties = { ...o.properties, kjTree: JSON.parse(JSON.stringify(node._tree)) };
         o.ideo = JSON.parse(JSON.stringify({ boxes: node._boxes, tree: node._tree, palette: node._stylePalette, importMode: findW("import_mode")?.value,
           outputFormat: findW("output_format")?.value, coordMode: findW("coord_mode")?.value, bboxOrder: findW("bbox_order")?.value,
           dock: { pinned: p.dockPinned, graph: p.dockGraph, rect: p.dockRect, panelH: node._panelH, min: p.dockMin,
@@ -3226,7 +3300,7 @@ app.registerExtension({
         if (!boxes) { for (const v of raw) { const b = _parseBoxes(v); if (b) { boxes = b; break; } } }
         if (!boxes) { for (const w of node.widgets || []) { const b = _parseBoxes(w?.value); if (b) { boxes = b; break; } } }
         if (boxes) {
-          resetTree(boxes.filter((b) => b && typeof b.x === "number"), o?.ideo?.tree);
+          resetTree(boxes.filter((b) => b && typeof b.x === "number"), o?.ideo?.tree || o?.properties?.kjTree);
           selectOnly(node._boxes.length ? 0 : -1);
         }
         const isPal = (p) => Array.isArray(p) && p.length && p.every((c) => typeof c === "string" && c[0] === "#");
@@ -3254,6 +3328,7 @@ app.registerExtension({
         }
         node._configured = true;                              // mark as loaded so initial layout keeps the restored size
         hideDataWidgets();
+        node.properties.kjTree = node._tree;
         serialize();                                         // realign widget values for Python + future saves
         if (bgBrightnessWidget) {
           if (typeof bgBrightnessWidget.value !== "number") bgBrightnessWidget.value = 25;  // old workflows may restore ""
